@@ -74,10 +74,10 @@ async def root():
         "message": "Invoice Transaction Register Extractor API with Subcategory Classification",
         "docs": "/docs",
         "endpoints": {
-            "upload": "POST /upload - Upload a single invoice PDF",
-            "upload_multiple": "POST /upload-multiple - Upload multiple invoice PDFs",
+            "upload": "POST /upload - Upload a single invoice (PDF or image)",
+            "upload_multiple": "POST /upload-multiple - Upload multiple invoices (PDF or image)",
         },
-        "supported_formats": ["PDF"],
+        "supported_formats": ["PDF", "JPEG", "JPG", "PNG", "TIFF"],
         "features": [
             "Automatic Purchase/Sales classification",
             "EU vs Non-EU country detection",
@@ -99,15 +99,19 @@ async def upload_and_extract(
     ),
 ):
     """
-    Upload a single invoice PDF and extract structured data with subcategory classification.
+    Upload a single invoice (PDF or image) and extract structured data with subcategory classification.
     """
     try:
-        # Validate file type
-        if not (file.content_type or "").startswith("application/pdf"):
+        # Validate file type (PDF or common image formats)
+        content_type = (file.content_type or "").lower()
+        if not (
+            content_type.startswith("application/pdf")
+            or content_type.startswith("image/")
+        ):
             return JSONResponse(status_code=400, content={
                 "filename": file.filename,
                 "status": "error",
-                "error": f"Unsupported content-type: {file.content_type}. Only application/pdf is accepted."
+                "error": f"Unsupported content-type: {file.content_type}. Only PDF and image types are accepted."
             })
 
         # Parse company list
@@ -177,7 +181,7 @@ async def upload_multiple_and_extract(
     ),
 ):
     """
-    Upload multiple invoice PDFs and extract structured data with subcategory classification.
+    Upload multiple invoices (PDFs or images) and extract structured data with subcategory classification.
     """
     if not files:
         return JSONResponse(status_code=400, content={
@@ -199,12 +203,16 @@ async def upload_multiple_and_extract(
         results = []
 
         for file in files:
-            if not file.filename or not (file.content_type or "").startswith("application/pdf"):
-                log.warning(f"Skipping invalid file: {file.filename}")
+            content_type = (file.content_type or "").lower()
+            if not file.filename or not (
+                content_type.startswith("application/pdf")
+                or content_type.startswith("image/")
+            ):
+                log.warning(f"Skipping invalid file: {file.filename} ({file.content_type})")
                 results.append({
                     "file_name": file.filename or "unknown",
                     "status": "error",
-                    "error": "Invalid file or content type (not PDF).",
+                    "error": "Invalid file or content type (only PDF and image types are accepted).",
                     "register_entry": None,
                 })
                 continue

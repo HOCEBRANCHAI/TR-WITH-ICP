@@ -1,18 +1,16 @@
 # processor.py
 # Robust extraction, OCR, FX, validation, mapping, and posting.
 # Used by app.py. No server here.
-
 import io
 import os
 import re
 import json
 import logging
+import imghdr
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import date, timedelta
-
 # Money / math
 from decimal import Decimal, ROUND_HALF_UP
-
 # OCR & PDF
 import PyPDF2
 import boto3
@@ -149,16 +147,41 @@ def get_eur_rate(invoice_date: date, ccy: str) -> Tuple[Decimal, str]:
         d = _prev_business_day(d - timedelta(days=1))
     raise ValueError(f"No EUR rate found for {ccy} near {invoice_date.isoformat()}.")
 
-# -------------------- OCR (robust, supports scanned PDFs) --------------------
+# -------------------- OCR (robust, supports PDFs & images) --------------------
+def _aws_region() -> str:
+    """
+    Prefer AWS_REGION if set, otherwise AWS_DEFAULT_REGION, otherwise us-east-1.
+    This keeps behaviour backwards compatible but makes region selection explicit.
+    """
+    return (
+        os.getenv("AWS_REGION")
+        or os.getenv("AWS_DEFAULT_REGION")
+        or "us-east-1"
+    )
+
+
 def _preprocess_for_tesseract(pil_img: Image.Image) -> Image.Image:
+    """
+    Aggressive but safe preprocessing to improve OCR quality:
+      - convert to grayscale
+      - bilateral filter to reduce noise but keep edges
+      - adaptive threshold for better contrast
+    """
     img = np.array(pil_img.convert("L"))
     img = cv2.bilateralFilter(img, 9, 75, 75)
-    img = cv2.adaptiveThreshold(img,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                cv2.THRESH_BINARY, 31, 11)
+    img = cv2.adaptiveThreshold(
+        img,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        11,
+    )
     return Image.fromarray(img)
 
+
 def _textract_analyze_image(img_bytes: bytes) -> str:
-    textract = boto3.client('textract', region_name=os.getenv('AWS_DEFAULT_REGION', 'us-east-1'))
+    textract = boto3.client("textract", region_name=_aws_region())
     resp = textract.analyze_document(
         Document={'Bytes': img_bytes},
         FeatureTypes=['TABLES', 'FORMS']
@@ -203,36 +226,62 @@ def _textract_analyze_image(img_bytes: bytes) -> str:
 
 def _tesseract_ocr(pil_img: Image.Image) -> str:
     pre = _preprocess_for_tesseract(pil_img)
-    return pytesseract.image_to_string(pre, config="--psm 6")
+    # Use English by default; --psm 6 handles block of text with uniform size.
+    # This dramatically improves character accuracy compared to the default.
+    return pytesseract.image_to_string(pre, config="--psm 6 -l eng")
 
 def get_text_from_pdf(pdf_bytes: bytes, filename: str) -> str:
     """
-    OCR strategy:
-      1) PyPDF2 text
-      2) Textract detect_document_text (whole PDF)
-      3) PDF → images → Textract AnalyzeDocument (per page)
-      4) PDF → images → Tesseract (last resort)
+    Robust, multi-strategy PDF text extraction with AWS Textract + Tesseract.
+
+    Strategy (in order):
+      1) PyPDF2 text (fast, cheap)
+      2) Textract detect_document_text (whole PDF, if AWS available)
+      3) PDF → images → Textract AnalyzeDocument (per page, for scanned PDFs)
+      4) PDF → images → Tesseract OCR (last resort)
+
+    We keep track of the *best* text seen so far (longest non-empty)
+    and, if all strategies are \"minimal\", we still return the best
+    attempt instead of failing. This guarantees that we always return
+    some text for the LLM, even on very difficult PDFs.
     """
+    best_text: str = ""
+    best_source: str = ""
+
+    def _update_best(candidate: str, source: str) -> None:
+        nonlocal best_text, best_source
+        if candidate and len(candidate.strip()) > len(best_text.strip()):
+            best_text = candidate
+            best_source = source
+
     # 1) PyPDF2
     try:
         reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
         text = "".join([(p.extract_text() or "") for p in reader.pages])
-        if len(text.strip()) > 100:
+        _update_best(text, "PyPDF2")
+        if len(text.strip()) > 80:
             log.info(f"[PyPDF2] {filename}")
             return text
-        log.warning(f"[PyPDF2] minimal for {filename}; try Textract detect.")
+        log.warning(f"[PyPDF2] minimal for {filename}; trying Textract detect.")
     except Exception as e:
         log.warning(f"[PyPDF2] failed for {filename}: {e}")
 
-    # 2) Textract detect
+    # 2) Textract detect (only if AWS creds/region likely configured)
     try:
-        textract = boto3.client('textract', region_name=os.getenv('AWS_DEFAULT_REGION', 'us-east-1'))
-        resp = textract.detect_document_text(Document={'Bytes': pdf_bytes})
-        text = "\n".join([b.get("Text","") for b in resp.get("Blocks", []) if b.get("BlockType")=="LINE"])
-        if len(text.strip()) > 40:
+        textract = boto3.client("textract", region_name=_aws_region())
+        resp = textract.detect_document_text(Document={"Bytes": pdf_bytes})
+        text = "\n".join(
+            [
+                b.get("Text", "")
+                for b in (resp.get("Blocks") or [])
+                if b.get("BlockType") == "LINE"
+            ]
+        )
+        _update_best(text, "Textract.detect")
+        if len(text.strip()) > 60:
             log.info(f"[Textract.detect] {filename}")
             return text
-        log.warning(f"[Textract.detect] minimal; try Analyze per page.")
+        log.warning(f"[Textract.detect] minimal for {filename}; trying Analyze per page.")
     except Exception as e:
         log.warning(f"[Textract.detect] failed for {filename}: {e}; Analyze per page.")
 
@@ -246,8 +295,9 @@ def get_text_from_pdf(pdf_bytes: bytes, filename: str) -> str:
             page_text = _textract_analyze_image(buf.getvalue())
             if page_text:
                 texts.append(page_text)
+                _update_best(page_text, "Textract.analyze IMG")
         combined = "\n\n--- PAGE BREAK ---\n\n".join(texts)
-        if len(combined.strip()) > 40:
+        if len(combined.strip()) > 60:
             log.info(f"[Textract.analyze IMG] {filename}")
             return combined
         log.warning(f"[Textract.analyze IMG] minimal; trying Tesseract.")
@@ -256,21 +306,139 @@ def get_text_from_pdf(pdf_bytes: bytes, filename: str) -> str:
 
     # 4) Tesseract fallback
     try:
-        images: List[Image.Image] = convert_from_bytes(pdf_bytes, dpi=300)
+        images = convert_from_bytes(pdf_bytes, dpi=300)
         ocr = []
         for im in images:
-            ocr.append(_tesseract_ocr(im))
+            page_text = _tesseract_ocr(im)
+            if page_text:
+                ocr.append(page_text)
+                _update_best(page_text, "Tesseract")
         combined = "\n\n--- PAGE BREAK ---\n\n".join(ocr)
-        if len(combined.strip()) > 10:
+        if len(combined.strip()) > 20:
             log.info(f"[Tesseract] {filename}")
             return combined
     except Exception as e:
         log.error(f"[Tesseract] failed for {filename}: {e}")
 
+    # If we reached this point, all strategies were "minimal".
+    # For production we still prefer returning *something* over hard failure.
+    if best_text.strip():
+        log.error(
+            f"PDF text extraction for {filename} only produced minimal text; "
+            f"returning best attempt from {best_source} with length={len(best_text.strip())}."
+        )
+        return best_text
+
+    # Absolute fallback – nothing at all could be read.
     raise ValueError(
         f"PDF text extraction failed for {filename}: "
-        f"PyPDF2, Textract detect, Textract analyze (per image), and Tesseract all returned minimal text."
+        f"PyPDF2, Textract detect, Textract analyze (per image), and Tesseract all returned empty text."
     )
+
+
+def get_text_from_image(image_bytes: bytes, filename: str) -> str:
+    """
+    Robust text extraction for image-based invoices (JPEG, PNG, TIFF, etc.)
+    using AWS Textract + Tesseract.
+    Strategy:
+      1) Textract detect_document_text
+      2) Textract analyze_document (FORMS+TABLES)
+      3) Tesseract OCR (with preprocessing)
+    """
+    best_text: str = ""
+    best_source: str = ""
+
+    def _update_best(candidate: str, source: str) -> None:
+        nonlocal best_text, best_source
+        if candidate and len(candidate.strip()) > len(best_text.strip()):
+            best_text = candidate
+            best_source = source
+
+    # 1) Textract detect
+    try:
+        textract = boto3.client("textract", region_name=_aws_region())
+        resp = textract.detect_document_text(Document={"Bytes": image_bytes})
+        text = "\n".join(
+            [
+                b.get("Text", "")
+                for b in (resp.get("Blocks") or [])
+                if b.get("BlockType") == "LINE"
+            ]
+        )
+        _update_best(text, "Textract.detect IMG")
+        if len(text.strip()) > 40:
+            log.info(f"[Textract.detect IMG] {filename}")
+            return text
+        log.warning(f"[Textract.detect IMG] minimal for {filename}; trying AnalyzeDocument.")
+    except Exception as e:
+        log.warning(f"[Textract.detect IMG] failed for {filename}: {e}; trying AnalyzeDocument.")
+
+    # 2) Textract AnalyzeDocument (FORMS + TABLES)
+    try:
+        analyzed = _textract_analyze_image(image_bytes)
+        _update_best(analyzed, "Textract.analyze IMG")
+        if len(analyzed.strip()) > 40:
+            log.info(f"[Textract.analyze IMG] {filename}")
+            return analyzed
+        log.warning(f"[Textract.analyze IMG] minimal for {filename}; trying Tesseract.")
+    except Exception as e:
+        log.warning(f"[Textract.analyze IMG helper] failed for {filename}: {e}; trying Tesseract.")
+
+    # 3) Tesseract fallback
+    try:
+        pil_img = Image.open(io.BytesIO(image_bytes))
+        text = _tesseract_ocr(pil_img)
+        _update_best(text, "Tesseract IMG")
+        if len(text.strip()) > 20:
+            log.info(f"[Tesseract IMG] {filename}")
+            return text
+    except Exception as e:
+        log.error(f"[Tesseract IMG] failed for {filename}: {e}")
+
+    # If we reached this point, only minimal text.
+    if best_text.strip():
+        log.error(
+            f"Image text extraction for {filename} only produced minimal text; "
+            f"returning best attempt from {best_source} with length={len(best_text.strip())}."
+        )
+        return best_text
+
+    raise ValueError(
+        f"Image text extraction failed for {filename}: "
+        f"Textract detect, Textract analyze, and Tesseract all returned empty text."
+    )
+
+
+def get_text_from_document(file_bytes: bytes, filename: str) -> str:
+    """
+    Entry point for *any* uploaded document.
+
+    - Detects whether the content is PDF or image using:
+        * PDF header (%PDF-) OR .pdf extension
+        * Standard image type detection (imghdr)
+    - Routes to the appropriate extraction function.
+    - If detection is ambiguous, defaults to the PDF pipeline because
+      most uploads in this app are invoice PDFs.
+    """
+    name = (filename or "").lower()
+    ext = os.path.splitext(name)[1]
+
+    # Quick PDF signature check
+    is_pdf_header = file_bytes.startswith(b"%PDF-")
+    if is_pdf_header or ext == ".pdf":
+        return get_text_from_pdf(file_bytes, filename)
+
+    # Image type detection
+    img_kind = imghdr.what(None, h=file_bytes)
+    if img_kind in {"jpeg", "png", "tiff", "bmp", "gif"}:
+        return get_text_from_image(file_bytes, filename)
+
+    # Ambiguous: try PDF pipeline first, then fall back to image logic if that fails
+    try:
+        return get_text_from_pdf(file_bytes, filename)
+    except Exception as e_pdf:
+        log.warning(f"PDF pipeline failed for {filename} ({e_pdf}); trying image pipeline.")
+        return get_text_from_image(file_bytes, filename)
 
 # -------------------- LLM extraction --------------------
 SECTION_LABELS = [
@@ -377,7 +545,7 @@ SCHEMA:
   "notes": "string | null"
 }
 
-"""                                                                                                                                                                                                                                
+"""
 def structure_text_with_llm(invoice_text: str, filename: str) -> dict:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -793,25 +961,45 @@ def _determine_dutch_vat_return_category(
     goods_services_indicator: Optional[str],
     reverse_charge_applied: bool,
     customer_vat_id: Optional[str],
-    vendor_vat_id: Optional[str]
+    vendor_vat_id: Optional[str],
+    vat_category: Optional[str],
 ) -> Optional[str]:
     """
-    Determines the Dutch VAT return category (1a, 1b, 1e, 2a, 3a, 3b, 4a, 4b, 5a) based on:
-    - Sales vs Purchase invoice
-    - Supplier/Customer country (NL, EU, non-EU)
-    - VAT Rate (21%, 9%, 0%)
-    - VAT Amount
-    - Goods vs Services
-    - Reverse charge signal
-    - Availability of VAT numbers
-    
-    Returns the category code or None/empty string if no match.
+    Determines the Dutch VAT return category according to the Dutch VAT return boxes:
+      - 1a: Sales taxed at standard rate (21%)
+      - 1b: Sales taxed at reduced rate (9%)
+      - 1c: Sales taxed at other rates / zero‑rated domestic supplies
+      - 1d: Private use of business assets  (typically manual adjustments; rarely auto‑detected)
+      - 1e: Sales exempt from VAT / out‑of‑scope
+      - 2a: Reverse‑charge supplies (domestic reverse‑charge)
+      - 3a: Supplies of goods to EU countries (B2B)
+      - 3b: Supplies of services to EU countries (B2B)
+      - 3c: Distance / installation sales to EU private individuals (B2C, no VAT ID)
+      - 4a: Purchases of goods from EU countries
+      - 4b: Purchases of services from EU countries
+      - 5a: Input VAT on domestic purchases with Dutch VAT
+
+    Logic is based on:
+      - Sales vs Purchase invoice
+      - Supplier/Customer country (NL, EU, non‑EU)
+      - VAT rate and VAT amount
+      - Goods vs Services
+      - Reverse charge signal
+      - Availability of VAT numbers
+      - High‑level VAT category (standard / zero‑rated / reverse‑charge / out‑of‑scope)
+
+    Returns the category code or None if no match.
     """
     # Normalize VAT percentage
     vat_rate = None
     if vat_percentage is not None:
         vat_rate = float(vat_percentage)
     
+    # Normalise VAT category from LLM ("standard", "zero-rated", "reverse-charge", "out-of-scope")
+    vat_cat = (vat_category or "").strip().lower()
+    is_zero_rated = vat_cat == "zero-rated"
+    is_out_of_scope_or_exempt = vat_cat in {"out-of-scope", "exempt", "exempt-supplies"}
+
     # Check if customer/vendor is NL
     is_customer_nl = _is_nl_country(customer_country) if customer_country else False
     is_vendor_nl = _is_nl_country(vendor_country) if vendor_country else False
@@ -830,35 +1018,68 @@ def _determine_dutch_vat_return_category(
     
     # SALES INVOICES
     if invoice_type == "Sales":
-        # 1a = NL customer, VAT 21%
-        if is_customer_nl and vat_rate is not None and abs(vat_rate - 21.0) < 0.1:
-            return "1a"
-        
-        # 1b = NL customer, VAT 9%
-        if is_customer_nl and vat_rate is not None and abs(vat_rate - 9.0) < 0.1:
-            return "1b"
-        
-        # 1e = Non-EU customer, VAT 0%
-        if is_customer_non_eu and vat_rate is not None and abs(vat_rate - 0.0) < 0.01:
-            return "1e"
-        
-        # 2a = NL customer, reverse charge (VAT 0%)
-        if is_customer_nl and reverse_charge_applied and (vat_rate is None or abs(vat_rate - 0.0) < 0.01):
-            return "2a"
-        
+        # ---- BOX 1: Domestic sales (NL customer) ----
+        if is_customer_nl:
+            # 1a = NL customer, VAT 21%
+            if vat_rate is not None and abs(vat_rate - 21.0) < 0.1:
+                return "1a"
+
+            # 1b = NL customer, VAT 9%
+            if vat_rate is not None and abs(vat_rate - 9.0) < 0.1:
+                return "1b"
+
+            # 2a = NL customer, reverse charge (VAT 0%)
+            if reverse_charge_applied and (vat_rate is None or abs(vat_rate - 0.0) < 0.01):
+                return "2a"
+
+            # 1e = Sales exempt from VAT / out-of-scope (no VAT charged, exempt category)
+            if is_out_of_scope_or_exempt and (vat_rate is None or abs(vat_rate - 0.0) < 0.01):
+                return "1e"
+
+            # 1c = Sales taxed at other rates or zero‑rated domestic supplies
+            # Any domestic sales with 0% VAT (not reverse charge, not exempt),
+            # or with a positive VAT rate that is not 21% or 9%.
+            if vat_rate is not None:
+                if abs(vat_rate - 0.0) < 0.01 and not reverse_charge_applied and not is_out_of_scope_or_exempt:
+                    return "1c"
+                if vat_rate > 0.01 and abs(vat_rate - 21.0) >= 0.1 and abs(vat_rate - 9.0) >= 0.1:
+                    return "1c"
+
+        # ---- BOX 3: Intra‑EU supplies ----
         # 3a = EU customer (not NL), goods, VAT 0%, VAT number present
-        if (is_customer_eu and 
-            goods_services_indicator == "goods" and 
-            vat_rate is not None and abs(vat_rate - 0.0) < 0.01 and 
-            has_customer_vat):
+        if (
+            is_customer_eu
+            and goods_services_indicator == "goods"
+            and vat_rate is not None
+            and abs(vat_rate - 0.0) < 0.01
+            and has_customer_vat
+        ):
             return "3a"
-        
+
         # 3b = EU customer (not NL), services, VAT 0%, VAT number present
-        if (is_customer_eu and 
-            goods_services_indicator == "services" and 
-            vat_rate is not None and abs(vat_rate - 0.0) < 0.01 and 
-            has_customer_vat):
+        if (
+            is_customer_eu
+            and goods_services_indicator == "services"
+            and vat_rate is not None
+            and abs(vat_rate - 0.0) < 0.01
+            and has_customer_vat
+        ):
             return "3b"
+
+        # 3c = Supplies of goods to EU private individuals (no VAT ID, distance / installation sales)
+        # Heuristic: EU (not NL) customer, GOODS, no VAT ID → Box 3c.
+        if (
+            is_customer_eu
+            and goods_services_indicator == "goods"
+            and not has_customer_vat
+        ):
+            return "3c"
+
+        # Exports to non‑EU with 0% VAT are typically zero‑rated supplies.
+        # These are often reported in 1c or 1e depending on exact Dutch guidance;
+        # we map them to 1c as zero‑rated non‑EU exports.
+        if is_customer_non_eu and vat_rate is not None and abs(vat_rate - 0.0) < 0.01:
+            return "1c"
     
     # PURCHASE INVOICES
     elif invoice_type == "Purchase":
@@ -890,6 +1111,23 @@ def _determine_dutch_vat_return_category(
     
     # No match - return None (will be set to empty string in mapping)
     return None
+
+
+# Descriptions for Dutch VAT return categories (for transaction register)
+DUTCH_VAT_CATEGORY_DESCRIPTIONS: Dict[str, str] = {
+    "1a": "Sales taxed at standard rate (21%)",
+    "1b": "Sales taxed at reduced rate (9%)",
+    "1c": "Sales taxed at other rates / zero-rated supplies",
+    "1d": "Private use of business assets",
+    "1e": "Sales exempt from VAT / out-of-scope",
+    "2a": "Reverse-charge supplies (domestic)",
+    "3a": "Supplies of goods to EU countries (B2B)",
+    "3b": "Supplies of services to EU countries (B2B)",
+    "3c": "Distance/installation sales to EU private individuals (B2C)",
+    "4a": "Purchases of goods from EU countries",
+    "4b": "Purchases of services from EU countries",
+    "5a": "Input VAT on domestic purchases (Dutch VAT)",
+}
 
 def _derive_vat_rate_percent(llm_data: Dict[str, Any]) -> Optional[float]:
     # look in vat_breakdown
@@ -949,7 +1187,7 @@ def _map_llm_output_to_register_entry(llm_data: Dict[str, Any]) -> Dict[str, Any
             if match:
                 reverse_charge_note = match.group(0).strip()
                 break
-    
+
     return {
         "Date": llm_data.get("invoice_date"),
         "Invoice Number": llm_data.get("invoice_number"),
@@ -1210,6 +1448,7 @@ def _classify_and_set_subcategory(register_entry: Dict[str, Any], our_companies_
     vat_amount = register_entry.get("VAT Amount")
     goods_services_indicator = register_entry.get("Goods Services Indicator")
     reverse_charge_applied = register_entry.get("Reverse Charge Applied", False)
+    vat_category = register_entry.get("VAT Category")
     
     dutch_vat_category = _determine_dutch_vat_return_category(
         invoice_type=invoice_type,
@@ -1220,10 +1459,19 @@ def _classify_and_set_subcategory(register_entry: Dict[str, Any], our_companies_
         goods_services_indicator=goods_services_indicator,
         reverse_charge_applied=reverse_charge_applied,
         customer_vat_id=customer_vat_id,
-        vendor_vat_id=vendor_vat_id
+        vendor_vat_id=vendor_vat_id,
+        vat_category=vat_category,
     )
     # Set to empty string if None (as per requirements)
     register_entry["Dutch VAT Return Category"] = dutch_vat_category if dutch_vat_category else ""
+
+    # Human-readable description for the Dutch VAT category
+    if dutch_vat_category:
+        register_entry["Dutch VAT Return Category Description"] = DUTCH_VAT_CATEGORY_DESCRIPTIONS.get(
+            dutch_vat_category, ""
+        )
+    else:
+        register_entry["Dutch VAT Return Category Description"] = ""
     
     # Log classification results for debugging
     log.info(f"Final classification - Type: {invoice_type}, Subcategory: {subcategory}, Dutch VAT Category: {dutch_vat_category or 'None'}")
@@ -1242,26 +1490,28 @@ def _convert_to_eur_fields(entry: dict, conversion_enabled: bool = True) -> dict
         entry["Gross Amount (EUR)"] = None
         entry["FX Conversion Note"] = "Currency conversion disabled"
         return entry
-    
     try:
-        ccy = (entry.get("Currency") or "").upper()
+        ccy = (entry.get("Currency") or "").upper().strip()
         inv_date_str = entry.get("Date")
-        
-        if not inv_date_str or not ccy or ccy == "EUR":
-            # No conversion needed for EUR or missing data
-            if ccy == "EUR":
-                entry["FX Rate (ccy->EUR)"] = "1.0000"
-                entry["Nett Amount (EUR)"] = round(float(entry.get("Nett Amount", 0) or 0), 2)
-                entry["VAT Amount (EUR)"] = round(float(entry.get("VAT Amount", 0) or 0), 2)
-                entry["Gross Amount (EUR)"] = round(float(entry.get("Gross Amount", 0) or 0), 2)
-            else:
-                entry["FX Rate (ccy->EUR)"] = None
-                entry["Nett Amount (EUR)"] = None
-                entry["VAT Amount (EUR)"] = None
-                entry["Gross Amount (EUR)"] = None
-                entry["FX Error"] = "Missing date or currency for conversion"
+
+        # Missing date or currency → cannot convert, but don't crash the pipeline
+        if not inv_date_str or not ccy:
+            entry["FX Rate (ccy->EUR)"] = None
+            entry["Nett Amount (EUR)"] = None
+            entry["VAT Amount (EUR)"] = None
+            entry["Gross Amount (EUR)"] = None
+            entry["FX Error"] = "Missing date or currency for conversion"
             return entry
-        
+
+        # Already in EUR: copy numbers directly and use rate 1.0
+        if ccy == "EUR":
+            entry["FX Rate (ccy->EUR)"] = "1.0000"
+            entry["FX Rate Date"] = inv_date_str
+            entry["Nett Amount (EUR)"] = round(float(entry.get("Nett Amount", 0) or 0), 2)
+            entry["VAT Amount (EUR)"] = round(float(entry.get("VAT Amount", 0) or 0), 2)
+            entry["Gross Amount (EUR)"] = round(float(entry.get("Gross Amount", 0) or 0), 2)
+            return entry
+
         inv_dt = date.fromisoformat(inv_date_str)
         rate, used_date = get_eur_rate(inv_dt, ccy)
         entry["FX Rate (ccy->EUR)"] = str(rate)
@@ -1276,7 +1526,7 @@ def _convert_to_eur_fields(entry: dict, conversion_enabled: bool = True) -> dict
             amt = Decimal(str(entry.get(k_src, 0) or 0))
             converted = q_money(amt * rate)
             entry[k_dst] = round(float(converted), 2)
-        
+
         return entry
     except Exception as ex:
         # Do not fail the whole invoice if FX fetch fails—attach note.
@@ -1290,7 +1540,9 @@ def _convert_to_eur_fields(entry: dict, conversion_enabled: bool = True) -> dict
 
 # -------------------- Main pipeline --------------------
 def robust_invoice_processor(pdf_bytes: bytes, filename: str) -> dict:
-    invoice_text = get_text_from_pdf(pdf_bytes, filename)
+    # Supports PDFs and common image formats (JPEG/PNG/TIFF/BMP/GIF).
+    # Uses AWS Textract + Tesseract under the hood.
+    invoice_text = get_text_from_document(pdf_bytes, filename)
     llm_data = structure_text_with_llm(invoice_text, filename)
     _ = validate_extraction(llm_data, filename)
     # attach raw text to Full_Extraction_Data for downstream heuristics if needed

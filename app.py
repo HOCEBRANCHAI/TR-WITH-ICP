@@ -46,6 +46,103 @@ from processor import (
     _split_company_list,
 )
 
+
+def _format_register_entry_for_frontend(entry: dict) -> dict:
+    """
+    Produce a clean, frontend-friendly transaction object from the raw register entry.
+
+    IMPORTANT: This does NOT change any business logic. It only reshapes what we return
+    to the client – we select the fields that are useful for the UI and drop heavy /
+    internal structures like the full LLM extraction text.
+    """
+    if not entry:
+        return {}
+
+    # Prefer EUR-converted amounts when available, fall back to native.
+    nett_amount = entry.get("Nett Amount (EUR)")
+    if nett_amount is None:
+        nett_amount = entry.get("Nett Amount")
+
+    vat_amount = entry.get("VAT Amount (EUR)")
+    if vat_amount is None:
+        vat_amount = entry.get("VAT Amount")
+
+    gross_amount = entry.get("Gross Amount (EUR)")
+    if gross_amount is None:
+        gross_amount = entry.get("Gross Amount")
+
+    formatted = {
+        # Core document identifiers
+        "Transaction Date": entry.get("Date"),
+        "Document Number": entry.get("Invoice Number"),
+        "Document Type": entry.get("Type"),
+
+        # Supplier (vendor) details
+        "Supplier Name": entry.get("Vendor Name"),
+        "Supplier VAT Number": entry.get("Vendor VAT ID"),
+        "Supplier Country": entry.get("Vendor Country"),
+        "Supplier Address": entry.get("Vendor Address"),
+        "Supplier IBAN": entry.get("Vendor IBAN"),
+
+        # Customer details
+        "Customer Name": entry.get("Customer Name"),
+        "Customer VAT Number": entry.get("Customer VAT ID"),
+        "Customer Country": entry.get("Customer Country"),
+        "Customer Address": entry.get("Customer Address"),
+        "Customer IBAN": entry.get("Customer IBAN"),
+
+        # Invoice economics
+        "Product/Service Description": entry.get("Description"),
+        "Net Amount": nett_amount,
+        "VAT Rate (%)": entry.get("VAT %"),
+        "VAT Amount": vat_amount,
+        "Total Amount": gross_amount,
+        "Currency": entry.get("Currency"),
+
+        # VAT / Dutch return view
+        # VAT Category as per applicable country (NL) – we expose both code and description.
+        "VAT Category (NL) Code": entry.get("Dutch VAT Return Category"),
+        "VAT Category (NL) Description": entry.get("Dutch VAT Return Category Description"),
+
+        # Reverse charge
+        "Reverse Charge Applied": entry.get("Reverse Charge Applied"),
+        "Reverse Charge Note": entry.get("Reverse Charge Note"),
+
+        # ICP reporting
+        "ICP Reporting Required": entry.get("ICP Return Required"),
+        "ICP Reporting Category": entry.get("ICP Reporting Category"),
+
+        # Goods / services
+        "Goods/Services Indicator": entry.get("Goods Services Indicator"),
+
+        # Corrections & references (not yet driven by logic – placeholders for future enrichment)
+        "Correction/Adjustment": entry.get("Correction/Adjustment"),
+        "Correction Reference": entry.get("Correction Reference"),
+        "Bank Transaction Reference": entry.get("Bank Transaction Reference"),
+
+        # Payments (we only know Due Date today; Payment Date/Status are for later enrichment)
+        "Payment Date": entry.get("Payment Date"),
+        "Payment Status": entry.get("Payment Status"),
+        "Due Date": entry.get("Due Date"),
+
+        # Free-form notes and attachment link
+        "Notes/Comments": entry.get("Notes"),
+        "Attachment Link": entry.get("Attachment Link"),
+
+        # FX / EUR view – useful for analytics (kept but not duplicated)
+        "FX Rate (ccy->EUR)": entry.get("FX Rate (ccy->EUR)"),
+        "FX Rate Date": entry.get("FX Rate Date"),
+        "Net Amount (EUR)": entry.get("Nett Amount (EUR)"),
+        "VAT Amount (EUR)": entry.get("VAT Amount (EUR)"),
+        "Total Amount (EUR)": entry.get("Gross Amount (EUR)"),
+
+        # Extraction quality signal
+        "Extraction Confidence": entry.get("Extraction Confidence"),
+        "Extraction Confidence Reason": entry.get("Extraction Confidence Reason"),
+    }
+
+    return formatted
+
 # Configuration
 conversion_enabled: bool = True  # Toggle currency conversion on/off
 
@@ -146,7 +243,7 @@ async def upload_and_extract(
         # Step 4: Apply currency conversion
         register_entry = _convert_to_eur_fields(register_entry, conversion_enabled)
 
-        # Step 5: Add conversion info to Full_Extraction_Data for audit trace
+        # Step 5: Add conversion info to Full_Extraction_Data for audit trace (internal use)
         if "Full_Extraction_Data" in register_entry:
             register_entry["Full_Extraction_Data"]["fx_conversion"] = {
                 "enabled": conversion_enabled,
@@ -154,11 +251,17 @@ async def upload_and_extract(
                 "rate_date": register_entry.get("FX Rate Date"),
                 "error": register_entry.get("FX Error")
             }
+            # Remove very heavy / internal-only fields from the object we return,
+            # especially the raw invoice text, which is not useful for the UI.
+            register_entry["Full_Extraction_Data"].pop("_invoice_text", None)
+
+        # Final shape for the frontend
+        formatted_entry = _format_register_entry_for_frontend(register_entry)
 
         return {
             "filename": file.filename,
             "status": "success",
-            "register_entry": register_entry,
+            "register_entry": formatted_entry,
         }
 
     except Exception as e:
@@ -235,7 +338,7 @@ async def upload_multiple_and_extract(
                 # Step 4: Apply currency conversion
                 register_entry = _convert_to_eur_fields(register_entry, conversion_enabled)
 
-                # Step 5: Add conversion info to Full_Extraction_Data for audit trace
+                # Step 5: Add conversion info to Full_Extraction_Data for audit trace (internal use)
                 if "Full_Extraction_Data" in register_entry:
                     register_entry["Full_Extraction_Data"]["fx_conversion"] = {
                         "enabled": conversion_enabled,
@@ -243,11 +346,16 @@ async def upload_multiple_and_extract(
                         "rate_date": register_entry.get("FX Rate Date"),
                         "error": register_entry.get("FX Error")
                     }
+                    # Remove raw invoice text from the object exposed to the client
+                    register_entry["Full_Extraction_Data"].pop("_invoice_text", None)
+
+                # Final shape for the frontend
+                formatted_entry = _format_register_entry_for_frontend(register_entry)
 
                 results.append({
                     "file_name": file.filename,
                     "status": "success",
-                    "register_entry": register_entry,
+                    "register_entry": formatted_entry,
                 })
 
             except Exception as e:
@@ -267,6 +375,7 @@ async def upload_multiple_and_extract(
         successful_files = sum(1 for r in results if r.get("status") == "success")
         failed_files = sum(1 for r in results if r.get("status") == "error")
 
+        # Aggregate totals from the formatted entries (which still expose the amounts we need).
         total_nett = Decimal("0.00")
         total_vat = Decimal("0.00")
         total_gross = Decimal("0.00")
@@ -278,15 +387,15 @@ async def upload_multiple_and_extract(
         for r in results:
             if r.get("status") == "success" and r.get("register_entry"):
                 e = r["register_entry"]
-                # Native currency totals
-                total_nett += q_money(e.get("Nett Amount", 0.0) or 0.0)
+                # Native currency totals (use Net/VAT/Total Amount; they correspond to source currency)
+                total_nett += q_money(e.get("Net Amount", 0.0) or 0.0)
                 total_vat += q_money(e.get("VAT Amount", 0.0) or 0.0)
-                total_gross += q_money(e.get("Gross Amount", 0.0) or 0.0)
+                total_gross += q_money(e.get("Total Amount", 0.0) or 0.0)
 
                 # EUR converted totals (if conversion was successful)
-                nett_eur = e.get("Nett Amount (EUR)")
+                nett_eur = e.get("Net Amount (EUR)")
                 vat_eur = e.get("VAT Amount (EUR)")
-                gross_eur = e.get("Gross Amount (EUR)")
+                gross_eur = e.get("Total Amount (EUR)")
 
                 if nett_eur is not None:
                     total_nett_eur += q_money(nett_eur)

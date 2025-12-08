@@ -572,7 +572,108 @@ def structure_text_with_llm(invoice_text: str, filename: str) -> dict:
         log.error(f"LLM API error {filename}: {e}")
         raise ValueError("Extraction failed: LLM API error.")
 
+def _translate_to_english_if_dutch(text: str) -> str:
+    """
+    Best‑effort translation helper:
+      - If the text appears in Dutch, translate it to English.
+      - If it is already English or another language, return it unchanged.
+    Uses the same OpenAI client as the main extraction. On any failure, returns
+    the original text so we never break the pipeline because of translation.
+    """
+    if not text or not text.strip():
+        return text
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        # No API key → cannot translate; keep original description.
+        return text
+
+    client = OpenAI(api_key=api_key)
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a translation helper. "
+                        "If the user text is Dutch, respond with an accurate English translation. "
+                        "If the text is already English or clearly not Dutch, return it exactly as-is. "
+                        "Output plain text only, no explanations, no quotes."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": text,
+                },
+            ],
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        return content or text
+    except Exception as ex:
+        log.error(f"Description translation failed: {ex}")
+        return text
+
+
 # -------------------- Validation & mapping --------------------
+def _estimate_extraction_confidence(invoice_text: str, llm_data: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Heuristic confidence score for how reliable the extraction likely is.
+    This is *not* a guarantee – just a signal to help prioritise manual review.
+
+    Factors:
+      - Length of extracted text (very short text => low confidence).
+      - Presence of key invoice keywords.
+      - Presence of critical LLM fields (invoice_number, dates, totals, parties).
+
+    Returns:
+      (level, reason) where level ∈ {"high", "medium", "low"}.
+    """
+    text = (invoice_text or "").strip()
+    text_len = len(text)
+
+    # 1) Base on text length
+    if text_len < 200:
+        level = "low"
+        reasons = [f"very short extracted text ({text_len} chars)"]
+    elif text_len < 800:
+        level = "medium"
+        reasons = [f"moderate extracted text length ({text_len} chars)"]
+    else:
+        level = "high"
+        reasons = [f"long extracted text ({text_len} chars)"]
+
+    # 2) Check for presence of section labels
+    text_low = text.lower()
+    present_labels = [lbl for lbl in SECTION_LABELS if lbl in text_low]
+    if len(present_labels) <= 2:
+        # Very few typical invoice markers found
+        reasons.append(f"few invoice keywords found ({len(present_labels)})")
+        if level == "high":
+            level = "medium"
+    elif len(present_labels) <= 5 and level == "high":
+        reasons.append(f"some invoice keywords found ({len(present_labels)})")
+
+    # 3) Check for missing critical LLM fields
+    critical_fields = [
+        "invoice_number",
+        "invoice_date",
+        "vendor_name",
+        "customer_name",
+        "subtotal",
+        "total_vat",
+        "total_amount",
+    ]
+    missing = [f for f in critical_fields if not llm_data.get(f)]
+    if missing:
+        reasons.append(f"missing critical fields from LLM: {', '.join(missing)}")
+        # Any missing core field should cap at medium; if already low, keep low
+        if level == "high":
+            level = "medium"
+
+    reason_str = "; ".join(reasons)
+    return level, reason_str
 def validate_extraction(data: dict, filename: str) -> Tuple[date, str, Decimal, Decimal, Decimal]:
     errors: List[str] = []
     for f in ["invoice_number","invoice_date","vendor_name","customer_name",
@@ -1129,6 +1230,74 @@ DUTCH_VAT_CATEGORY_DESCRIPTIONS: Dict[str, str] = {
     "5a": "Input VAT on domestic purchases (Dutch VAT)",
 }
 
+
+def _set_icp_fields_for_nl(register_entry: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Determine ICP reporting flags for a Dutch company (Netherlands) for a single transaction.
+
+    Implements the following logic:
+      Step 1 – Only NL company:
+        - We assume the company is established in the Netherlands.
+      Step 2 – ICP‑relevant transaction (Netherlands perspective):
+        - Counterparty country is an EU country other than the Netherlands
+        - B2B (we approximate B2B as: counterparty VAT number present)
+        - Counterparty VAT number is not empty
+        - Dutch VAT Return Category in {2a, 3a, 3b, 4a}
+        - Reverse charge applies
+        - Exclude purchases/acquisitions from other EU countries (only Sales are ICP‑relevant)
+      Step 3 – Assign ICP reporting category label based on Dutch VAT category.
+
+    Adds / updates on register_entry:
+      - "ICP Return Required": "Yes" or "No"   (per transaction)
+      - "ICP Reporting Category": human‑readable label for ICP‑relevant lines
+    """
+    # Defaults – assume no ICP unless all conditions are met
+    register_entry["ICP Return Required"] = "No"
+    register_entry["ICP Reporting Category"] = ""
+
+    invoice_type = register_entry.get("Type")
+    if invoice_type != "Sales":
+        # ICP report from NL perspective only covers outbound intra‑EU B2B supplies,
+        # not purchases/acquisitions from other EU countries.
+        return register_entry
+
+    # Determine counterparty details from our perspective
+    counterparty_country = register_entry.get("Customer Country")
+    counterparty_vat_number = register_entry.get("Customer VAT ID")
+
+    if not counterparty_country:
+        return register_entry
+
+    # Counterparty must be in EU but not Netherlands
+    if not _is_eu_country(counterparty_country) or _is_nl_country(counterparty_country):
+        return register_entry
+
+    # B2B only – require a non‑empty VAT number
+    if not counterparty_vat_number or not str(counterparty_vat_number).strip():
+        return register_entry
+
+    # VAT category must be one of the ICP‑relevant Dutch VAT boxes
+    dutch_vat_category = (register_entry.get("Dutch VAT Return Category") or "").strip().lower()
+    icp_relevant_categories = {"2a", "3a", "3b", "4a"}
+    if dutch_vat_category not in icp_relevant_categories:
+        return register_entry
+
+    # Reverse charge must apply
+    if not register_entry.get("Reverse Charge Applied", False):
+        return register_entry
+
+    # Map Dutch VAT category to ICP reporting category label
+    icp_reporting_category_map = {
+        "2a": "Intra-EU supply of goods (B2B)",
+        "3a": "Intra-EU supply of services (B2B, reverse charge)",
+        "3b": "Adjustments/credit notes for ICP goods/services",
+        "4a": "Other EU B2B reverse-charge transactions",
+    }
+
+    register_entry["ICP Return Required"] = "Yes"
+    register_entry["ICP Reporting Category"] = icp_reporting_category_map.get(dutch_vat_category, "")
+    return register_entry
+
 def _derive_vat_rate_percent(llm_data: Dict[str, Any]) -> Optional[float]:
     # look in vat_breakdown
     for v in (llm_data.get("vat_breakdown") or []):
@@ -1147,10 +1316,17 @@ def _derive_vat_rate_percent(llm_data: Dict[str, Any]) -> Optional[float]:
 def _map_llm_output_to_register_entry(llm_data: Dict[str, Any]) -> Dict[str, Any]:
     description = ""
     if llm_data.get("line_items"):
-        description = llm_data["line_items"][0].get("description", "")
+        raw_desc = llm_data["line_items"][0].get("description", "") or ""
+        # If the description is in Dutch, convert it to English. Otherwise keep as-is.
+        description = _translate_to_english_if_dutch(raw_desc)
 
     vat_percentage = _derive_vat_rate_percent(llm_data)
     invoice_text = llm_data.get("_invoice_text", "")
+
+    # Heuristic confidence score for extraction quality
+    extraction_confidence_level, extraction_confidence_reason = _estimate_extraction_confidence(
+        invoice_text, llm_data
+    )
     
     # Determine goods/services indicator
     goods_services_indicator = _determine_goods_services_indicator(llm_data, invoice_text)
@@ -1214,26 +1390,29 @@ def _map_llm_output_to_register_entry(llm_data: Dict[str, Any]) -> Dict[str, Any
         "Goods Services Indicator": goods_services_indicator,
         "Subcategory": "Unclassified",  # Will be set after type classification
         "Dutch VAT Return Category": None,  # Will be set after type classification
+        # ICP fields (Netherlands – will be populated after VAT/category classification)
+        "ICP Return Required": "No",            # "Yes"/"No" per transaction
+        "ICP Reporting Category": "",           # Human‑readable ICP category label
+        # Extraction quality signal (for manual review / dashboards)
+        "Extraction Confidence": extraction_confidence_level,
+        "Extraction Confidence Reason": extraction_confidence_reason,
         "Due Date": llm_data.get("due_date"),  # Payment due date
         "Payment Terms": llm_data.get("payment_terms"),  # Payment terms/notes
         "Notes": llm_data.get("notes"),  # General notes/comments
         "Full_Extraction_Data": llm_data
     }
-
 def _classify_type(register_entry: Dict[str, Any], our_companies_list: List[str]) -> str:
     """
     Classifies invoice as Purchase or Sales based on whether our company appears
     as customer (Purchase) or vendor (Sales).
     
     Uses multiple matching strategies with similarity scoring for robust classification.
-    """
+      """
     vendor_name = register_entry.get("Vendor Name") or ""
     customer_name = register_entry.get("Customer Name") or ""
-    
     if not vendor_name and not customer_name:
         log.warning("Both vendor and customer names are empty - cannot classify")
         return "Unclassified"
-    
     v = _normalize_company_name(vendor_name)
     c = _normalize_company_name(customer_name)
     ours = [_normalize_company_name(x) for x in our_companies_list]
@@ -1464,7 +1643,7 @@ def _classify_and_set_subcategory(register_entry: Dict[str, Any], our_companies_
     )
     # Set to empty string if None (as per requirements)
     register_entry["Dutch VAT Return Category"] = dutch_vat_category if dutch_vat_category else ""
-
+    
     # Human-readable description for the Dutch VAT category
     if dutch_vat_category:
         register_entry["Dutch VAT Return Category Description"] = DUTCH_VAT_CATEGORY_DESCRIPTIONS.get(
@@ -1472,9 +1651,18 @@ def _classify_and_set_subcategory(register_entry: Dict[str, Any], our_companies_
         )
     else:
         register_entry["Dutch VAT Return Category Description"] = ""
+
+    # Set ICP flags/labels for this transaction according to Dutch ICP rules
+    register_entry = _set_icp_fields_for_nl(register_entry)
     
     # Log classification results for debugging
-    log.info(f"Final classification - Type: {invoice_type}, Subcategory: {subcategory}, Dutch VAT Category: {dutch_vat_category or 'None'}")
+    log.info(
+        f"Final classification - Type: {invoice_type}, "
+        f"Subcategory: {subcategory}, "
+        f"Dutch VAT Category: {dutch_vat_category or 'None'}, "
+        f"ICP Return Required: {register_entry.get('ICP Return Required')}, "
+        f"ICP Reporting Category: {register_entry.get('ICP Reporting Category')}"
+    )
     
     return register_entry
 

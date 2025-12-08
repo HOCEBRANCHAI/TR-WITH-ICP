@@ -6,7 +6,8 @@ uvicorn
 PyPDF2>=3.0
 pdf2image
 Pillow
-opencv-python
+# Use headless OpenCV on servers (no GUI/libGL dependencies)
+opencv-python-headless
 numpy
 pytesseract
 

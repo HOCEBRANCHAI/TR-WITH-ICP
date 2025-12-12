@@ -6,7 +6,6 @@ import os
 import re
 import json
 import logging
-import imghdr
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import date, timedelta
 # Money / math
@@ -1234,17 +1233,23 @@ def _set_icp_fields_for_nl(register_entry: Dict[str, Any]) -> Dict[str, Any]:
     """
     Determine ICP reporting flags for a Dutch company (Netherlands) for a single transaction.
 
-    Implements the following logic:
-      Step 1 – Only NL company:
-        - We assume the company is established in the Netherlands.
-      Step 2 – ICP‑relevant transaction (Netherlands perspective):
-        - Counterparty country is an EU country other than the Netherlands
-        - B2B (we approximate B2B as: counterparty VAT number present)
-        - Counterparty VAT number is not empty
-        - Dutch VAT Return Category in {2a, 3a, 3b, 4a}
-        - Reverse charge applies
-        - Exclude purchases/acquisitions from other EU countries (only Sales are ICP‑relevant)
-      Step 3 – Assign ICP reporting category label based on Dutch VAT category.
+    Business rule (as agreed with accounting):
+
+      - ICP only applies to **B2B sales** from NL to **other EU countries**
+        where the customer has a valid VAT number.
+      - Purchases (even from EU) are **never** reported in ICP – they only
+        appear in the VAT return (boxes 4a/4b).
+      - Domestic NL sales/purchases are **never** ICP.
+
+    In simple terms:
+      "Is this a B2B sale to another EU country with a valid VAT number?
+       If YES → Include in ICP. If NO → Do not include."
+
+    Implementation notes:
+      - We approximate "B2B" by checking that the customer VAT ID is non‑empty.
+      - We do **not** depend on the Dutch VAT return box being a specific code;
+        this keeps the ICP flag independent from any box‑mapping imperfections.
+      - We still provide a human readable ICP category based on goods vs services.
 
     Adds / updates on register_entry:
       - "ICP Return Required": "Yes" or "No"   (per transaction)
@@ -1256,11 +1261,17 @@ def _set_icp_fields_for_nl(register_entry: Dict[str, Any]) -> Dict[str, Any]:
 
     invoice_type = register_entry.get("Type")
     if invoice_type != "Sales":
-        # ICP report from NL perspective only covers outbound intra‑EU B2B supplies,
-        # not purchases/acquisitions from other EU countries.
+        # ICP only covers outbound intra‑EU B2B sales, never purchases.
         return register_entry
 
-    # Determine counterparty details from our perspective
+    # Our company is established in NL – for Sales, we assume we are the vendor.
+    vendor_country = register_entry.get("Vendor Country")
+    if vendor_country and not _is_nl_country(vendor_country):
+        # If, for some reason, the vendor is not recognised as NL, we err on the
+        # side of caution and skip ICP for this line.
+        return register_entry
+
+    # Determine counterparty details from our perspective (customer side)
     counterparty_country = register_entry.get("Customer Country")
     counterparty_vat_number = register_entry.get("Customer VAT ID")
 
@@ -1275,26 +1286,18 @@ def _set_icp_fields_for_nl(register_entry: Dict[str, Any]) -> Dict[str, Any]:
     if not counterparty_vat_number or not str(counterparty_vat_number).strip():
         return register_entry
 
-    # VAT category must be one of the ICP‑relevant Dutch VAT boxes
-    dutch_vat_category = (register_entry.get("Dutch VAT Return Category") or "").strip().lower()
-    icp_relevant_categories = {"2a", "3a", "3b", "4a"}
-    if dutch_vat_category not in icp_relevant_categories:
-        return register_entry
-
-    # Reverse charge must apply
-    if not register_entry.get("Reverse Charge Applied", False):
-        return register_entry
-
-    # Map Dutch VAT category to ICP reporting category label
-    icp_reporting_category_map = {
-        "2a": "Intra-EU supply of goods (B2B)",
-        "3a": "Intra-EU supply of services (B2B, reverse charge)",
-        "3b": "Adjustments/credit notes for ICP goods/services",
-        "4a": "Other EU B2B reverse-charge transactions",
-    }
+    # At this point, we have an intra‑EU B2B sale with a VAT number → ICP.
+    # Use goods/services flag to describe the ICP type.
+    gsi = (register_entry.get("Goods Services Indicator") or "").lower()
+    if gsi == "goods":
+        icp_cat = "Sales of goods to EU VAT customers (B2B, non-NL)"
+    elif gsi == "services":
+        icp_cat = "Sales of services to EU VAT customers (B2B, non-NL, reverse charge)"
+    else:
+        icp_cat = "Intra-EU B2B supply (goods/services unclear)"
 
     register_entry["ICP Return Required"] = "Yes"
-    register_entry["ICP Reporting Category"] = icp_reporting_category_map.get(dutch_vat_category, "")
+    register_entry["ICP Reporting Category"] = icp_cat
     return register_entry
 
 def _derive_vat_rate_percent(llm_data: Dict[str, Any]) -> Optional[float]:
@@ -1642,7 +1645,7 @@ def _classify_and_set_subcategory(register_entry: Dict[str, Any], our_companies_
     )
     # Set to empty string if None (as per requirements)
     register_entry["Dutch VAT Return Category"] = dutch_vat_category if dutch_vat_category else ""
-    
+
     # Human-readable description for the Dutch VAT category
     if dutch_vat_category:
         register_entry["Dutch VAT Return Category Description"] = DUTCH_VAT_CATEGORY_DESCRIPTIONS.get(

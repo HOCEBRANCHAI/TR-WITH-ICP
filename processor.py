@@ -167,23 +167,23 @@ def _preprocess_for_tesseract(pil_img: Image.Image) -> Image.Image:
 
 def _textract_analyze_image(img_bytes: bytes) -> str:
     try:
-        textract = boto3.client("textract", region_name=_aws_region())
-        resp = textract.analyze_document(
-            Document={'Bytes': img_bytes},
-            FeatureTypes=['TABLES', 'FORMS']
-        )
-        blocks = resp.get("Blocks", [])
-        text_lines = []
-        block_map = {b["Id"]: b for b in blocks}
+    textract = boto3.client("textract", region_name=_aws_region())
+    resp = textract.analyze_document(
+        Document={'Bytes': img_bytes},
+        FeatureTypes=['TABLES', 'FORMS']
+    )
+    blocks = resp.get("Blocks", [])
+    text_lines = []
+    block_map = {b["Id"]: b for b in blocks}
 
-        for b in blocks:
-            if b.get("BlockType") == "LINE" and b.get("Text"):
-                text_lines.append(b["Text"])
-        
+    for b in blocks:
+        if b.get("BlockType") == "LINE" and b.get("Text"):
+            text_lines.append(b["Text"])
+
         # Simplified KV extraction for context
-        kv_pairs = []
-        for b in blocks:
-             if b.get("BlockType") == "KEY_VALUE_SET" and "KEY" in (b.get("EntityTypes") or []):
+    kv_pairs = []
+    for b in blocks:
+        if b.get("BlockType") == "KEY_VALUE_SET" and "KEY" in (b.get("EntityTypes") or []):
                  pass # Skipping complex KV reconstruction for brevity, relying on Lines
         
         return "\n".join(text_lines)
@@ -256,7 +256,7 @@ def get_text_from_pdf(pdf_bytes: bytes, filename: str) -> str:
     except Exception as e:
         log.error(f"[Tesseract] failed: {e}")
 
-    return best_text
+        return best_text
 
 
 def get_text_from_image(image_bytes: bytes, filename: str) -> str:
@@ -283,12 +283,12 @@ def get_text_from_image(image_bytes: bytes, filename: str) -> str:
 def get_text_from_document(file_bytes: bytes, filename: str) -> str:
     name = (filename or "").lower()
     ext = os.path.splitext(name)[1]
-    
+
     is_pdf_header = file_bytes.startswith(b"%PDF-")
     if is_pdf_header or ext == ".pdf":
         return get_text_from_pdf(file_bytes, filename)
-    
-    return get_text_from_image(file_bytes, filename)
+
+        return get_text_from_image(file_bytes, filename)
 
 # -------------------- LLM extraction --------------------
 SECTION_LABELS = [
@@ -404,12 +404,12 @@ def validate_extraction(data: dict, filename: str) -> Tuple[date, str, Decimal, 
     errors = []
     inv_date = ensure_iso_date(data.get("invoice_date"), "invoice_date", errors)
     currency = normalize_currency(data.get("currency"), errors)
-    
+
     # We allow validation "failures" to pass as soft errors in robust mode, 
     # but logging them is important.
     if errors:
         log.warning(f"Validation warnings for {filename}: {errors}")
-        
+
     return inv_date, currency, 0, 0, 0 # Return placeholders if needed
 
 def _normalize_company_name(name: str) -> str:
@@ -447,7 +447,7 @@ def _is_same_country_code(code: str, country_name: str) -> bool:
     c_name = mapping.get(code.upper(), "")
     if c_name and c_name.lower() in country_name.lower():
         return True
-    return False
+        return False
 
 def _perform_sanity_check_and_swap(entry: Dict[str, Any], our_companies: List[str]) -> Dict[str, Any]:
     """
@@ -538,19 +538,116 @@ def _determine_invoice_subcategory(type_str, v_addr, c_addr, vat_pct, text):
         
     return "Unclassified"
 
-DOTCH_VAT_CATEGORY_DESCRIPTIONS = {
+# Dutch VAT return boxes (official view)
+DUTCH_VAT_CATEGORY_DESCRIPTIONS = {
     "1a": "Sales taxed at standard rate (21%)",
+    "1b": "Sales taxed at reduced rate (9%)",
+    "2a": "Domestic reverse-charge supplies (NL customer)",
+    "3a": "Intra-EU supplies of goods to VAT-registered customers (0%)",
+    "3b": "Intra-EU supplies of services to VAT-registered customers (0%, reverse charge)",
     "4a": "Purchases of goods from EU countries",
+    "4b": "Purchases of services from EU countries",
     "5a": "Input VAT on domestic purchases (Dutch VAT)",
 }
 
 def _determine_dutch_vat_return_category(invoice_type, vendor_country, customer_country, **kwargs):
-    # Simplified logic for robustness
+    """
+    Map each transaction into a Dutch VAT return box.
+
+    We use:
+      - invoice_type: "Sales" or "Purchase"
+      - vendor_country / customer_country
+      - vat_pct: effective VAT rate (float or None)
+      - vat_amount: VAT amount
+      - goods_services: "goods" / "services" / None
+      - vat_category: high-level LLM label ("standard", "zero-rated", "reverse-charge", "out-of-scope", "import-vat")
+      - customer_vat_id / vendor_vat_id: presence of VAT ID as B2B signal
+
+    For now we support the main boxes: 1a, 1b, 2a, 3a, 3b, 4a, 4b, 5a.
+    Anything that does not cleanly match one of these returns "" (no box).
+    """
+    vat_pct = kwargs.get("vat_pct")
+    vat_amount = kwargs.get("vat_amount")
+    goods_services = (kwargs.get("goods_services") or "").lower()
+    vat_category = (kwargs.get("vat_category") or "").lower()
+    customer_vat_id = kwargs.get("customer_vat_id") or ""
+    vendor_vat_id = kwargs.get("vendor_vat_id") or ""
+
+    has_customer_vat = bool(str(customer_vat_id).strip())
+    has_vendor_vat = bool(str(vendor_vat_id).strip())
+
+    is_cust_nl = _is_nl_country(customer_country)
+    is_vend_nl = _is_nl_country(vendor_country)
+    is_cust_eu = _is_eu_country(customer_country) and not is_cust_nl
+    is_vend_eu = _is_eu_country(vendor_country) and not is_vend_nl
+    is_cust_non_eu = bool(customer_country) and not is_cust_nl and not is_cust_eu
+
+    # Helper: compare VAT % with tolerance
+    def _approx(x, target):
+        if x is None:
+            return False
+        try:
+            return abs(float(x) - target) < 0.2
+        except Exception:
+            return False
+
+    # SALES LOGIC
+    if invoice_type == "Sales":
+        # Domestic NL customer
+        if is_cust_nl:
+            # 1a – NL customer, 21% VAT
+            if _approx(vat_pct, 21.0):
+                return "1a"
+            # 1b – NL customer, 9% VAT
+            if _approx(vat_pct, 9.0):
+                return "1b"
+            # 2a – Domestic reverse-charge
+            # We treat any NL customer + vat_category == reverse-charge as 2a
+            if vat_category == "reverse-charge":
+                return "2a"
+            # Other domestic NL patterns (0%, exempt etc.) not mapped to a specific box here.
+            return ""
+
+        # EU (not NL) customer – intra-EU B2B
+        if is_cust_eu and has_customer_vat:
+            # 3a – goods, 0% VAT
+            if goods_services == "goods" and (vat_pct is None or _approx(vat_pct, 0.0)):
+                return "3a"
+            # 3b – services, 0% VAT (reverse charge applies)
+            if goods_services == "services" and (vat_pct is None or _approx(vat_pct, 0.0)):
+                return "3b"
+            # If we can't clearly distinguish goods/services we leave it blank.
+            return ""
+
+        # Exports to non-EU are typically zero-rated but go in a different box (1c)
+        # which we do not model explicitly here, so we return "".
+        if is_cust_non_eu and (vat_pct is None or _approx(vat_pct, 0.0)):
+            return ""
+
+        # Anything else on the sales side is left unmapped for now.
+        return ""
+
+    # PURCHASE LOGIC
     if invoice_type == "Purchase":
-        if _is_nl_country(vendor_country): return "5a"
-        if _is_eu_country(vendor_country): return "4a"
-        # Non-EU imports usually handled via license or customs, often not on simple VAT return boxes directly unless 4a/4b logic applies.
-        return "" 
+        # 5a – Domestic purchases with Dutch VAT (vendor NL + VAT > 0)
+        if is_vend_nl:
+            if (vat_pct is not None and float(vat_pct) > 0.01) or (vat_amount is not None and float(vat_amount) > 0.0):
+                return "5a"
+            return ""
+
+        # EU supplier (not NL) – intra-EU acquisitions
+        if is_vend_eu:
+            if goods_services == "goods":
+                return "4a"
+            if goods_services == "services":
+                return "4b"
+            # If goods/services unclear, we still leave the box empty.
+            return ""
+
+        # Non-EU purchases: usually handled as imports; we don't force them into 4a/4b.
+        return ""
+
+    # Anything else (Unclassified) → no box
     return ""
 
 
@@ -671,7 +768,13 @@ def _classify_and_set_subcategory(entry: Dict[str, Any], our_companies: List[str
     entry["Dutch VAT Return Category"] = _determine_dutch_vat_return_category(
         entry["Type"],
         entry.get("Vendor Country"),
-        entry.get("Customer Country")
+        entry.get("Customer Country"),
+        vat_pct=entry.get("VAT %"),
+        vat_amount=entry.get("VAT Amount"),
+        goods_services=entry.get("Goods Services Indicator"),
+        vat_category=entry.get("VAT Category"),
+        customer_vat_id=entry.get("Customer VAT ID"),
+        vendor_vat_id=entry.get("Vendor VAT ID"),
     )
     entry["Dutch VAT Return Category Description"] = DUTCH_VAT_CATEGORY_DESCRIPTIONS.get(entry["Dutch VAT Return Category"], "")
     
@@ -683,7 +786,7 @@ def _classify_and_set_subcategory(entry: Dict[str, Any], our_companies: List[str
     entry["Extraction Confidence"] = conf
     entry["Extraction Confidence Reason"] = reason
     
-    return entry
+        return entry
 
 def _convert_to_eur_fields(entry: dict, enabled: bool = True) -> dict:
     if not enabled: return entry
@@ -705,8 +808,8 @@ def _convert_to_eur_fields(entry: dict, enabled: bool = True) -> dict:
     except Exception as e:
         log.warning(f"FX conversion failed: {e}")
         entry["FX Error"] = str(e)
-        
-    return entry
+
+        return entry
 
 # -------------------- Main pipeline --------------------
 def robust_invoice_processor(pdf_bytes: bytes, filename: str) -> dict:

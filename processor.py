@@ -441,9 +441,9 @@ def _is_same_country_code(code: str, country_name: str) -> bool:
         "GB": "United Kingdom", "UK": "United Kingdom"
     }
     c_name = mapping.get(code.upper(), "")
-    if c_name and c_name.lower() in country_name.lower():
+    if c_name and c_name.lower() in (country_name or "").lower():
         return True
-        return False
+    return False
 
 def _perform_sanity_check_and_swap(entry: Dict[str, Any], our_companies: List[str]) -> Dict[str, Any]:
     """
@@ -465,17 +465,16 @@ def _perform_sanity_check_and_swap(entry: Dict[str, Any], our_companies: List[st
         
         # Assumption: Our company uses NL banks. If IBAN is Foreign, it's likely not us receiving money.
         if iban_code != "NL":
-             log.warning(f"Sanity Swap Triggered: Vendor IBAN ({iban_code}) is foreign but type is Sales. Swapping entities.")
-             
-             # Swap relevant fields
-             entry["Vendor Name"], entry["Customer Name"] = entry["Customer Name"], entry["Vendor Name"]
-             entry["Vendor Address"], entry["Customer Address"] = entry["Customer Address"], entry["Vendor Address"]
-             entry["Vendor Country"], entry["Customer Country"] = entry["Customer Country"], entry["Vendor Country"]
-             entry["Vendor VAT ID"], entry["Customer VAT ID"] = entry["Customer VAT ID"], entry["Vendor VAT ID"]
-             
-             # Force type to Purchase
-             entry["Type"] = "Purchase"
-             
+            log.warning(
+                f"Sanity Swap Triggered: Vendor IBAN ({iban_code}) is foreign but type is Sales. Swapping entities."
+            )
+            # Swap relevant fields
+            entry["Vendor Name"], entry["Customer Name"] = entry["Customer Name"], entry["Vendor Name"]
+            entry["Vendor Address"], entry["Customer Address"] = entry["Customer Address"], entry["Vendor Address"]
+            entry["Vendor Country"], entry["Customer Country"] = entry["Customer Country"], entry["Vendor Country"]
+            entry["Vendor VAT ID"], entry["Customer VAT ID"] = entry["Customer VAT ID"], entry["Vendor VAT ID"]
+            # Force type to Purchase
+            entry["Type"] = "Purchase"
     return entry
 
 # -------------------- Classification Helpers --------------------
@@ -608,10 +607,10 @@ def _determine_dutch_vat_return_category(invoice_type, vendor_country, customer_
         if is_cust_eu and has_customer_vat:
             # 3a – goods, 0% VAT
             if goods_services == "goods" and (vat_pct is None or _approx(vat_pct, 0.0)):
-            return "3a"
+                return "3a"
             # 3b – services, 0% VAT (reverse charge applies)
             if goods_services == "services" and (vat_pct is None or _approx(vat_pct, 0.0)):
-            return "3b"
+                return "3b"
             # If we can't clearly distinguish goods/services we leave it blank.
             return ""
 
@@ -636,7 +635,7 @@ def _determine_dutch_vat_return_category(invoice_type, vendor_country, customer_
             if goods_services == "goods":
                 return "4a"
             if goods_services == "services":
-            return "4b"
+                return "4b"
             # If goods/services unclear, we still leave the box empty.
             return ""
 
@@ -782,7 +781,7 @@ def _classify_and_set_subcategory(entry: Dict[str, Any], our_companies: List[str
     entry["Extraction Confidence"] = conf
     entry["Extraction Confidence Reason"] = reason
     
-        return entry
+    return entry
 
 def _convert_to_eur_fields(entry: dict, enabled: bool = True) -> dict:
     if not enabled: return entry
@@ -791,8 +790,8 @@ def _convert_to_eur_fields(entry: dict, enabled: bool = True) -> dict:
         dt = entry.get("Date")
         ccy = entry.get("Currency")
         if not dt or not ccy:
-             raise ValueError("Missing date/currency")
-             
+            raise ValueError("Missing date/currency")
+            
         rate, date_used = get_eur_rate(date.fromisoformat(dt), ccy)
         
         entry["FX Rate (ccy->EUR)"] = str(rate)
@@ -804,8 +803,8 @@ def _convert_to_eur_fields(entry: dict, enabled: bool = True) -> dict:
     except Exception as e:
         log.warning(f"FX conversion failed: {e}")
         entry["FX Error"] = str(e)
-
-        return entry
+    
+    return entry
 
 # -------------------- Main pipeline --------------------
 def robust_invoice_processor(pdf_bytes: bytes, filename: str) -> dict:

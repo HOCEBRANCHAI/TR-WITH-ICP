@@ -166,26 +166,21 @@ def _preprocess_for_tesseract(pil_img: Image.Image) -> Image.Image:
 
 
 def _textract_analyze_image(img_bytes: bytes) -> str:
+    """
+    Helper for Textract AnalyzeDocument on an image.
+    We keep it simple and just return all LINE texts joined together.
+    """
     try:
     textract = boto3.client("textract", region_name=_aws_region())
     resp = textract.analyze_document(
         Document={'Bytes': img_bytes},
         FeatureTypes=['TABLES', 'FORMS']
     )
-    blocks = resp.get("Blocks", [])
-    text_lines = []
-    block_map = {b["Id"]: b for b in blocks}
-
+        blocks = resp.get("Blocks", []) or []
+        text_lines: List[str] = []
     for b in blocks:
         if b.get("BlockType") == "LINE" and b.get("Text"):
             text_lines.append(b["Text"])
-
-        # Simplified KV extraction for context
-    kv_pairs = []
-    for b in blocks:
-        if b.get("BlockType") == "KEY_VALUE_SET" and "KEY" in (b.get("EntityTypes") or []):
-                 pass # Skipping complex KV reconstruction for brevity, relying on Lines
-        
         return "\n".join(text_lines)
     except Exception as e:
         log.warning(f"Textract analysis failed: {e}")
@@ -612,10 +607,10 @@ def _determine_dutch_vat_return_category(invoice_type, vendor_country, customer_
         if is_cust_eu and has_customer_vat:
             # 3a – goods, 0% VAT
             if goods_services == "goods" and (vat_pct is None or _approx(vat_pct, 0.0)):
-                return "3a"
+            return "3a"
             # 3b – services, 0% VAT (reverse charge applies)
             if goods_services == "services" and (vat_pct is None or _approx(vat_pct, 0.0)):
-                return "3b"
+            return "3b"
             # If we can't clearly distinguish goods/services we leave it blank.
             return ""
 
@@ -640,7 +635,7 @@ def _determine_dutch_vat_return_category(invoice_type, vendor_country, customer_
             if goods_services == "goods":
                 return "4a"
             if goods_services == "services":
-                return "4b"
+            return "4b"
             # If goods/services unclear, we still leave the box empty.
             return ""
 

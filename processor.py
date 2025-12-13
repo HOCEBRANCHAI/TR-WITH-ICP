@@ -171,16 +171,16 @@ def _textract_analyze_image(img_bytes: bytes) -> str:
     We keep it simple and just return all LINE texts joined together.
     """
     try:
-    textract = boto3.client("textract", region_name=_aws_region())
-    resp = textract.analyze_document(
-        Document={'Bytes': img_bytes},
-        FeatureTypes=['TABLES', 'FORMS']
-    )
+        textract = boto3.client("textract", region_name=_aws_region())
+        resp = textract.analyze_document(
+            Document={'Bytes': img_bytes},
+            FeatureTypes=['TABLES', 'FORMS']
+        )
         blocks = resp.get("Blocks", []) or []
         text_lines: List[str] = []
-    for b in blocks:
-        if b.get("BlockType") == "LINE" and b.get("Text"):
-            text_lines.append(b["Text"])
+        for b in blocks:
+            if b.get("BlockType") == "LINE" and b.get("Text"):
+                text_lines.append(b["Text"])
         return "\n".join(text_lines)
     except Exception as e:
         log.warning(f"Textract analysis failed: {e}")
@@ -282,8 +282,9 @@ def get_text_from_document(file_bytes: bytes, filename: str) -> str:
     is_pdf_header = file_bytes.startswith(b"%PDF-")
     if is_pdf_header or ext == ".pdf":
         return get_text_from_pdf(file_bytes, filename)
-
-        return get_text_from_image(file_bytes, filename)
+    
+    # Otherwise treat as image (or image-like)
+    return get_text_from_image(file_bytes, filename)
 
 # -------------------- LLM extraction --------------------
 SECTION_LABELS = [

@@ -100,9 +100,10 @@ def _format_register_entry_for_frontend(entry: dict) -> dict:
         "Currency": entry.get("Currency"),
 
         # VAT / Dutch return view
-        # VAT Category as per applicable country (NL) – we expose both code and description.
+        # VAT Category as per applicable country (NL) – we expose code, description and reasoning.
         "VAT Category (NL) Code": entry.get("Dutch VAT Return Category"),
         "VAT Category (NL) Description": entry.get("Dutch VAT Return Category Description"),
+        "VAT Category (NL) Reason": entry.get("Dutch VAT Return Category Reason"),
 
         # Reverse charge
         "Reverse Charge Applied": entry.get("Reverse Charge Applied"),

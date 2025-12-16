@@ -1,7 +1,6 @@
 # processor.py
 # Robust extraction, OCR, FX, validation, mapping, and posting.
 # Used by app.py. No server here.
-
 import io
 import os
 import re
@@ -9,10 +8,8 @@ import json
 import logging
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import date, timedelta
-
 # Money / math
 from decimal import Decimal, ROUND_HALF_UP
-
 # OCR & PDF
 import PyPDF2
 import boto3
@@ -99,7 +96,7 @@ def normalize_currency(cur: Optional[str], errors: List[str]) -> Optional[str]:
     cur = (cur or "").strip().upper()
     if cur not in KNOWN_CURRENCIES:
         errors.append(f"Unknown or missing currency {cur!r}.")
-        return "EUR" # Default to EUR to avoid pipeline crash, but error logged
+        return None
     return cur
 
 def _prev_business_day(d: date) -> date:
@@ -110,6 +107,7 @@ def _prev_business_day(d: date) -> date:
 def get_eur_rate(invoice_date: date, ccy: str) -> Tuple[Decimal, str]:
     """
     Return (rate, rate_date_str) for 1 CCY -> EUR using exchangerate.host (ECB).
+    Try direct (base=CCY&symbols=EUR) and fallback by inversion.
     Look back up to 7 business days.
     """
     ccy = (ccy or "").upper().strip()
@@ -126,6 +124,7 @@ def get_eur_rate(invoice_date: date, ccy: str) -> Tuple[Decimal, str]:
             rate = (js1.get("rates") or {}).get("EUR")
             if r1.status_code == 200 and rate:
                 return q_rate(rate), d.isoformat()
+            log.warning(f"FX miss (direct) {url1} status={r1.status_code}")
         except Exception as ex:
             log.warning(f"FX direct failed {url1}: {ex}")
 
@@ -138,17 +137,22 @@ def get_eur_rate(invoice_date: date, ccy: str) -> Tuple[Decimal, str]:
             if r2.status_code == 200 and base_rate and float(base_rate) != 0.0:
                 inv = Decimal("1") / Decimal(str(base_rate))
                 return q_rate(inv), d.isoformat()
+            log.warning(f"FX miss (invert) {url2} status={r2.status_code}")
         except Exception as ex2:
             log.warning(f"FX invert failed {url2}: {ex2}")
 
         d = _prev_business_day(d - timedelta(days=1))
     
-    # Fallback to 1.0 if not found (don't crash)
-    log.error(f"FX Rate not found for {ccy} on {invoice_date}. Defaulting to 1.0")
+    # NEW: Better fallback than crash
+    log.error(f"No EUR rate found for {ccy} near {invoice_date.isoformat()}. Using 1.0.")
     return Decimal("1.0"), invoice_date.isoformat()
 
 # -------------------- OCR (robust, supports PDFs & images) --------------------
 def _aws_region() -> str:
+    """
+    Prefer AWS_REGION if set, otherwise AWS_DEFAULT_REGION, otherwise us-east-1.
+    This keeps behaviour backwards compatible but makes region selection explicit.
+    """
     return (
         os.getenv("AWS_REGION")
         or os.getenv("AWS_DEFAULT_REGION")
@@ -157,37 +161,73 @@ def _aws_region() -> str:
 
 
 def _preprocess_for_tesseract(pil_img: Image.Image) -> Image.Image:
+    """
+    Aggressive but safe preprocessing to improve OCR quality:
+      - convert to grayscale
+      - bilateral filter to reduce noise but keep edges
+      - adaptive threshold for better contrast
+    """
     img = np.array(pil_img.convert("L"))
     img = cv2.bilateralFilter(img, 9, 75, 75)
     img = cv2.adaptiveThreshold(
-        img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11,
+        img,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        11,
     )
     return Image.fromarray(img)
 
 
 def _textract_analyze_image(img_bytes: bytes) -> str:
-    """
-    Helper for Textract AnalyzeDocument on an image.
-    We keep it simple and just return all LINE texts joined together.
-    """
-    try:
-        textract = boto3.client("textract", region_name=_aws_region())
-        resp = textract.analyze_document(
-            Document={'Bytes': img_bytes},
-            FeatureTypes=['TABLES', 'FORMS']
-        )
-        blocks = resp.get("Blocks", []) or []
-        text_lines: List[str] = []
-        for b in blocks:
-            if b.get("BlockType") == "LINE" and b.get("Text"):
-                text_lines.append(b["Text"])
-        return "\n".join(text_lines)
-    except Exception as e:
-        log.warning(f"Textract analysis failed: {e}")
-        return ""
+    textract = boto3.client("textract", region_name=_aws_region())
+    resp = textract.analyze_document(
+        Document={'Bytes': img_bytes},
+        FeatureTypes=['TABLES', 'FORMS']
+    )
+    blocks = resp.get("Blocks", [])
+    text_lines = []
+    block_map = {b["Id"]: b for b in blocks}
+
+    for b in blocks:
+        if b.get("BlockType") == "LINE" and b.get("Text"):
+            text_lines.append(b["Text"])
+
+    kv_pairs = []
+    for b in blocks:
+        if b.get("BlockType") == "KEY_VALUE_SET" and "KEY" in (b.get("EntityTypes") or []):
+            key_words, val_words = [], []
+            for rel in b.get("Relationships", []):
+                if rel["Type"] == "CHILD":
+                    for cid in rel.get("Ids", []):
+                        w = block_map.get(cid)
+                        if w and w.get("BlockType") == "WORD" and w.get("Text"):
+                            key_words.append(w["Text"])
+                if rel["Type"] == "VALUE":
+                    for vid in rel.get("Ids", []):
+                        v = block_map.get(vid)
+                        if not v: continue
+                        for rel2 in v.get("Relationships", []):
+                            if rel2["Type"] == "CHILD":
+                                for vcid in rel2.get("Ids", []):
+                                    w = block_map.get(vcid)
+                                    if w and w.get("BlockType") == "WORD" and w.get("Text"):
+                                        val_words.append(w["Text"])
+            k = " ".join(key_words).strip()
+            v = " ".join(val_words).strip()
+            if k or v:
+                kv_pairs.append(f"{k}: {v}")
+
+    combined = "\n".join(text_lines)
+    if kv_pairs:
+        combined += "\n--- Key-Value Pairs ---\n" + "\n".join(kv_pairs)
+    return combined
 
 def _tesseract_ocr(pil_img: Image.Image) -> str:
     pre = _preprocess_for_tesseract(pil_img)
+    # Use English by default; --psm 6 handles block of text with uniform size.
+    # This dramatically improves character accuracy compared to the default.
     return pytesseract.image_to_string(pre, config="--psm 6 -l eng")
 
 def get_text_from_pdf(pdf_bytes: bytes, filename: str) -> str:
@@ -206,20 +246,30 @@ def get_text_from_pdf(pdf_bytes: bytes, filename: str) -> str:
         text = "".join([(p.extract_text() or "") for p in reader.pages])
         _update_best(text, "PyPDF2")
         if len(text.strip()) > 80:
+            log.info(f"[PyPDF2] {filename}")
             return text
+        log.warning(f"[PyPDF2] minimal for {filename}; trying Textract detect.")
     except Exception as e:
-        log.warning(f"[PyPDF2] failed: {e}")
+        log.warning(f"[PyPDF2] failed for {filename}: {e}")
 
-    # 2) Textract detect
+    # 2) Textract detect (only if AWS creds/region likely configured)
     try:
         textract = boto3.client("textract", region_name=_aws_region())
         resp = textract.detect_document_text(Document={"Bytes": pdf_bytes})
-        text = "\n".join([b.get("Text", "") for b in (resp.get("Blocks") or []) if b.get("BlockType") == "LINE"])
+        text = "\n".join(
+            [
+                b.get("Text", "")
+                for b in (resp.get("Blocks") or [])
+                if b.get("BlockType") == "LINE"
+            ]
+        )
         _update_best(text, "Textract.detect")
         if len(text.strip()) > 60:
+            log.info(f"[Textract.detect] {filename}")
             return text
-    except Exception:
-        pass
+        log.warning(f"[Textract.detect] minimal for {filename}; trying Analyze per page.")
+    except Exception as e:
+        log.warning(f"[Textract.detect] failed for {filename}: {e}; Analyze per page.")
 
     # 3) Textract Analyze per-page (images)
     try:
@@ -232,11 +282,13 @@ def get_text_from_pdf(pdf_bytes: bytes, filename: str) -> str:
             if page_text:
                 texts.append(page_text)
                 _update_best(page_text, "Textract.analyze IMG")
-        combined = "\n".join(texts)
+        combined = "\n\n--- PAGE BREAK ---\n\n".join(texts)
         if len(combined.strip()) > 60:
+            log.info(f"[Textract.analyze IMG] {filename}")
             return combined
-    except Exception:
-        pass
+        log.warning(f"[Textract.analyze IMG] minimal; trying Tesseract.")
+    except Exception as e:
+        log.warning(f"[Textract.analyze IMG] failed for {filename}: {e}; Tesseract fallback.")
 
     # 4) Tesseract fallback
     try:
@@ -247,51 +299,126 @@ def get_text_from_pdf(pdf_bytes: bytes, filename: str) -> str:
             if page_text:
                 ocr.append(page_text)
                 _update_best(page_text, "Tesseract")
-        return "\n".join(ocr)
+        combined = "\n\n--- PAGE BREAK ---\n\n".join(ocr)
+        if len(combined.strip()) > 20:
+            log.info(f"[Tesseract] {filename}")
+            return combined
     except Exception as e:
-        log.error(f"[Tesseract] failed: {e}")
+        log.error(f"[Tesseract] failed for {filename}: {e}")
 
+    # If we reached this point, all strategies were "minimal".
+    # For production we still prefer returning *something* over hard failure.
+    if best_text.strip():
+        log.error(
+            f"PDF text extraction for {filename} only produced minimal text; "
+            f"returning best attempt from {best_source} with length={len(best_text.strip())}."
+        )
         return best_text
+
+    # Absolute fallback – nothing at all could be read.
+    raise ValueError(
+        f"PDF text extraction failed for {filename}: "
+        f"PyPDF2, Textract detect, Textract analyze (per image), and Tesseract all returned empty text."
+    )
 
 
 def get_text_from_image(image_bytes: bytes, filename: str) -> str:
+    """
+    Robust text extraction for image-based invoices (JPEG, PNG, TIFF, etc.)
+    using AWS Textract + Tesseract.
+    """
+    best_text: str = ""
+    best_source: str = ""
+
+    def _update_best(candidate: str, source: str) -> None:
+        nonlocal best_text, best_source
+        if candidate and len(candidate.strip()) > len(best_text.strip()):
+            best_text = candidate
+            best_source = source
+
     # 1) Textract detect
     try:
         textract = boto3.client("textract", region_name=_aws_region())
         resp = textract.detect_document_text(Document={"Bytes": image_bytes})
-        text = "\n".join([b.get("Text", "") for b in (resp.get("Blocks") or []) if b.get("BlockType") == "LINE"])
+        text = "\n".join(
+            [
+                b.get("Text", "")
+                for b in (resp.get("Blocks") or [])
+                if b.get("BlockType") == "LINE"
+            ]
+        )
+        _update_best(text, "Textract.detect IMG")
         if len(text.strip()) > 40:
+            log.info(f"[Textract.detect IMG] {filename}")
             return text
-    except Exception:
-        pass
+        log.warning(f"[Textract.detect IMG] minimal for {filename}; trying AnalyzeDocument.")
+    except Exception as e:
+        log.warning(f"[Textract.detect IMG] failed for {filename}: {e}; trying AnalyzeDocument.")
 
-    # 2) Tesseract fallback
+    # 2) Textract AnalyzeDocument (FORMS + TABLES)
+    try:
+        analyzed = _textract_analyze_image(image_bytes)
+        _update_best(analyzed, "Textract.analyze IMG")
+        if len(analyzed.strip()) > 40:
+            log.info(f"[Textract.analyze IMG] {filename}")
+            return analyzed
+        log.warning(f"[Textract.analyze IMG] minimal for {filename}; trying Tesseract.")
+    except Exception as e:
+        log.warning(f"[Textract.analyze IMG helper] failed for {filename}: {e}; trying Tesseract.")
+
+    # 3) Tesseract fallback
     try:
         pil_img = Image.open(io.BytesIO(image_bytes))
-        return _tesseract_ocr(pil_img)
-    except Exception:
-        pass
-    
-    return ""
+        text = _tesseract_ocr(pil_img)
+        _update_best(text, "Tesseract IMG")
+        if len(text.strip()) > 20:
+            log.info(f"[Tesseract IMG] {filename}")
+            return text
+    except Exception as e:
+        log.error(f"[Tesseract IMG] failed for {filename}: {e}")
+
+    # If we reached this point, only minimal text.
+    if best_text.strip():
+        log.error(
+            f"Image text extraction for {filename} only produced minimal text; "
+            f"returning best attempt from {best_source} with length={len(best_text.strip())}."
+        )
+        return best_text
+
+    raise ValueError(
+        f"Image text extraction failed for {filename}: "
+        f"Textract detect, Textract analyze, and Tesseract all returned empty text."
+    )
 
 
 def get_text_from_document(file_bytes: bytes, filename: str) -> str:
+    """
+    Entry point for *any* uploaded document.
+    """
     name = (filename or "").lower()
     ext = os.path.splitext(name)[1]
 
+    # Quick PDF signature check
     is_pdf_header = file_bytes.startswith(b"%PDF-")
     if is_pdf_header or ext == ".pdf":
         return get_text_from_pdf(file_bytes, filename)
-    
-    # Otherwise treat as image (or image-like)
-    return get_text_from_image(file_bytes, filename)
+
+    # Image type detection via filename extension
+    if ext in {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".gif"}:
+        return get_text_from_image(file_bytes, filename)
+
+    # Ambiguous: try PDF pipeline first, then fall back to image logic if that fails
+    try:
+        return get_text_from_pdf(file_bytes, filename)
+    except Exception as e_pdf:
+        log.warning(f"PDF pipeline failed for {filename} ({e_pdf}); trying image pipeline.")
+        return get_text_from_image(file_bytes, filename)
 
 # -------------------- LLM extraction --------------------
 SECTION_LABELS = [
     "invoice", "total", "subtotal", "tax", "vat", "btw", "reverse charge",
     "verlegd", "omgekeerde heffing", "bill to", "payer", "customer", "vendor",
-    "supplier", "line items", "description", "due", "payment terms", "amount",
-    "iban", "bank", "account"
+    "supplier", "line items", "description", "due", "payment terms", "amount"
 ]
 
 def reduce_invoice_text(raw_text: str, window: int = 300) -> str:
@@ -320,43 +447,96 @@ def reduce_invoice_text(raw_text: str, window: int = 300) -> str:
     return reduced[:12000]
 
 LLM_PROMPT = """
-You are an expert financial data extraction model. Extract structured data into a JSON object.
+You are an expert, high-accuracy financial data extraction model. Your sole task is to extract structured data from the provided invoice text and respond with a single, minified JSON object. You must think like an accountant.
 
 RULES:
-1. **Parties**: 
-   - **Vendor**: Entity getting paid. Look for top logo or "Bank Details".
-   - **Customer**: Entity being billed. Look for "Bill To".
-   - *Tip*: If the invoice shows an IBAN for payment, that IBAN belongs to the Vendor.
-2. **IBANs**: Extract 'vendor_iban' and 'customer_iban' carefully.
-3. **VAT**: 'vat_category' must be 'Import-VAT', 'Reverse-Charge', 'Standard', 'Zero-Rated', or 'Out-of-Scope'.
-4. **Dates**: YYYY-MM-DD.
-5. **Addresses**: Extract FULL addresses including COUNTRY.
-
+1) JSON ONLY. Include all top-level keys even if null. Dates = YYYY-MM-DD. Numbers = floats (no symbols).
+2) Use the invoice currency shown in the official TOTAL block; ignore "for reference" currencies.
+3) subtotal = goods/services only; total_vat = all taxes; total_amount = subtotal + total_vat.
+4) VAT category:
+   - "Import-VAT" for import VAT.
+   - "Reverse-Charge" if reverse-charge applies (e.g., verlegd, omgekeerde heffing).
+   - "Standard" for normal % VAT charged.
+   - "Zero-Rated" if 0% VAT and not reverse charge.
+   - "Out-of-Scope" if outside tax scope (e.g., Article 44).
+5) Line items:
+   - Extract goods/services only; do NOT include taxes as a line item.
+   - unit_price only if explicitly printed. Do not compute it.
+6) VAT percentage:
+   - If the invoice explicitly shows a single VAT rate (e.g., 21%), put that in vat_breakdown.rate.
+   - If text states "VAT out of scope / Article 44 / reverse charge / 0%", use 0.0 in vat_breakdown.
+   - If multiple rates exist, list them; total_vat must equal the sum of tax_amount.
+7) ADDRESSES - CRITICAL FOR VAT CLASSIFICATION:
+   - Extract COMPLETE addresses including street, city, postal code, and COUNTRY.
+   - The country is ESSENTIAL for determining EU vs non-EU transactions.
+   - Look for country names (e.g., "Netherlands", "Germany", "France") or country codes (e.g., "NL", "DE", "FR") at the end of addresses.
+   - If country is not explicitly stated, INFER it from well-known city names:
+     * Cities like "Galway", "Dublin", "Cork" → Ireland
+     * Cities like "London", "Manchester", "Birmingham" → United Kingdom
+     * Cities like "Amsterdam", "Rotterdam", "The Hague" → Netherlands
+     * Cities like "Paris", "Lyon", "Marseille" → France
+     * Cities like "Berlin", "Munich", "Hamburg" → Germany
+     * Cities like "Madrid", "Barcelona", "Valencia" → Spain
+     * Cities like "Rome", "Milan", "Naples" → Italy
+     * And other major EU/non-EU cities you recognize
+   - Always include the inferred country in the address string (e.g., "Annaghdown, Galway, Ireland").
+   - Include the full address as a single string with all address components.
+   - This is critical for production-level VAT subcategory classification.
+8) VAT NUMBERS - CRITICAL FOR EU B2B CLASSIFICATION:
+   - Extract VAT registration numbers for both vendor and customer.
+   - VAT numbers typically appear near company names or in header/footer sections.
+   - Common formats: "NL123456789B01", "GB123456789", "IE1234567X", "DE123456789", etc.
+   - Look for labels like "VAT", "BTW", "TVA", "IVA", "VAT Reg No", "Tax ID", "Registration No".
+   - For EU customers, VAT number is REQUIRED for proper B2B classification.
+   - If VAT number is not found, set to null (do not guess or invent).
+9) GOODS VS SERVICES:
+   - Determine if the invoice is for "goods" or "services" based on line item descriptions.
+   - Look for keywords like "product", "item", "goods", "merchandise" for goods.
+   - Look for keywords like "service", "consulting", "support", "maintenance", "software license" for services.
+   - If unclear, default to "services" for B2B transactions, "goods" for physical products.
+   - Set "goods_services_indicator" to "goods" or "services" or null if truly unclear.
+10) BANK ACCOUNT DETAILS (IBAN):
+   - Extract IBAN numbers for both vendor and customer if present on the invoice.
+   - IBAN is typically found in payment/banking sections of invoices.
+   - Format: IBAN codes start with 2-letter country code followed by 2 digits and up to 30 alphanumeric characters.
+   - Extract "vendor_iban" from vendor's bank account details.
+   - Extract "customer_iban" from customer's bank account details (if shown).
+   - IBAN can be a signal for local vs non-local transactions affecting VAT categorization.
+11) NOTES AND COMMENTS:
+   - Extract any general notes, comments, or additional information from the invoice.
+   - Include payment instructions, special terms, or any other relevant notes.
+   - Store in "notes" field.
 SCHEMA:
+
 {
   "invoice_number": "string | null",
   "invoice_date": "YYYY-MM-DD | null",
   "due_date": "YYYY-MM-DD | null",
   "vendor_name": "string | null",
   "vendor_vat_id": "string | null",
-  "vendor_address": "string | null",
+  "vendor_address": "string | null (MUST include full address with country)",
   "customer_name": "string | null",
   "customer_vat_id": "string | null",
-  "customer_address": "string | null",
+  "customer_address": "string | null (MUST include full address with country)",
   "currency": "string | null",
   "vat_category": "string | null",
   "subtotal": "float | null",
   "total_amount": "float | null",
   "total_vat": "float | null",
-  "vat_breakdown": [{"rate": "float", "base_amount": "float", "tax_amount": "float"}],
-  "line_items": [{"description": "string", "quantity": "float", "unit_price": "float", "line_total": "float"}],
+  "vat_breakdown": [
+    {"rate": "float | 'import'", "base_amount": "float | null", "tax_amount": "float"}
+  ],
+  "line_items": [
+    {"description": "string", "quantity": "float | null", "unit_price": "float | null", "line_total": "float | null"}
+  ],
+  "payment_terms": "string | null",
   "goods_services_indicator": "goods | services | null",
   "vendor_iban": "string | null",
   "customer_iban": "string | null",
   "notes": "string | null"
 }
-"""
 
+"""
 def structure_text_with_llm(invoice_text: str, filename: str) -> dict:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -372,61 +552,380 @@ def structure_text_with_llm(invoice_text: str, filename: str) -> dict:
             temperature=0.0,
             messages=[
                 {"role": "system", "content": LLM_PROMPT},
-                {"role": "user", "content": f"**INVOICE TEXT:**\n{reduced}"}
+                {"role": "user", "content": f"**INVOICE TEXT TO PARSE (reduced):**\n{reduced}"}
             ]
         )
         return json.loads(r.choices[0].message.content)
+    except json.JSONDecodeError as e:
+        log.error(f"LLM JSON error {filename}: {e}")
+        # Return empty structure to not crash
+        return {}
     except Exception as e:
-        log.error(f"LLM extraction error: {e}")
+        log.error(f"LLM API error {filename}: {e}")
+        # Return empty structure to not crash
         return {}
 
 def _translate_to_english_if_dutch(text: str) -> str:
-    # Simplified for brevity; assuming English preferred
-    return text
+    """
+    Best‑effort translation helper:
+      - If the text appears in Dutch, translate it to English.
+      - If it is already English or another language, return it unchanged.
+    Uses the same OpenAI client as the main extraction. On any failure, returns
+    the original text so we never break the pipeline because of translation.
+    """
+    if not text or not text.strip():
+        return text
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        # No API key → cannot translate; keep original description.
+        return text
+
+    client = OpenAI(api_key=api_key)
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a translation helper. "
+                        "If the user text is Dutch, respond with an accurate English translation. "
+                        "If the text is already English or clearly not Dutch, return it exactly as-is. "
+                        "Output plain text only, no explanations, no quotes."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": text,
+                },
+            ],
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        return content or text
+    except Exception as ex:
+        log.error(f"Description translation failed: {ex}")
+        return text
+
 
 # -------------------- Validation & mapping --------------------
-def _estimate_extraction_confidence(invoice_text: str, llm_data: Dict[str, Any]) -> Tuple[str, str]:
-    text_len = len(invoice_text)
-    if text_len < 200: return "low", "very short text"
+def _estimate_extraction_confidence(invoice_text: str, llm_data: Dict[str, Any], validation_errors: Optional[List[str]] = None) -> Tuple[str, str]:
+    """
+    Heuristic confidence score for how reliable the extraction likely is.
+    This is *not* a guarantee – just a signal to help prioritise manual review.
     
-    missing = []
-    if not llm_data.get("total_amount"): missing.append("total")
-    if not llm_data.get("invoice_date"): missing.append("date")
-    
-    if missing: return "medium", f"missing {','.join(missing)}"
-    return "high", "good data density"
+    Args:
+        invoice_text: Raw extracted text from OCR/PDF
+        llm_data: Structured data extracted by LLM
+        validation_errors: List of validation errors from validate_extraction()
+    """
+    text = (invoice_text or "").strip()
+    text_len = len(text)
+    validation_errors = validation_errors or []
 
-def validate_extraction(data: dict, filename: str) -> Tuple[date, str, Decimal, Decimal, Decimal]:
-    errors = []
+    # 1) Base on text length
+    if text_len < 200:
+        level = "low"
+        reasons = [f"very short extracted text ({text_len} chars)"]
+    elif text_len < 800:
+        level = "medium"
+        reasons = [f"moderate extracted text length ({text_len} chars)"]
+    else:
+        level = "high"
+        reasons = [f"long extracted text ({text_len} chars)"]
+
+    # 2) Check for presence of section labels
+    text_low = text.lower()
+    present_labels = [lbl for lbl in SECTION_LABELS if lbl in text_low]
+    if len(present_labels) <= 2:
+        reasons.append(f"few invoice keywords found ({len(present_labels)})")
+        if level == "high":
+            level = "medium"
+    elif len(present_labels) <= 5 and level == "high":
+        reasons.append(f"some invoice keywords found ({len(present_labels)})")
+
+    # 3) Check for missing critical LLM fields
+    critical_fields = [
+        "invoice_number",
+        "invoice_date",
+        "vendor_name",
+        "customer_name",
+        "subtotal",
+        "total_vat",
+        "total_amount",
+    ]
+    missing = [f for f in critical_fields if not llm_data.get(f)]
+    if missing:
+        reasons.append(f"missing critical fields from LLM: {', '.join(missing)}")
+        if level == "high":
+            level = "medium"
+
+    # 4) VALIDATION ERRORS - Most important factor
+    if validation_errors:
+        # Any validation error significantly reduces confidence
+        error_count = len(validation_errors)
+        reasons.append(f"validation errors detected: {error_count} issue(s)")
+        if error_count >= 3:
+            level = "low"
+        elif error_count >= 2:
+            if level == "high":
+                level = "medium"
+            elif level == "medium":
+                level = "low"
+        else:
+            if level == "high":
+                level = "medium"
+
+    reason_str = "; ".join(reasons)
+    return level, reason_str
+
+def validate_extraction(data: dict, filename: str) -> Tuple[date, str, Decimal, Decimal, Decimal, List[str]]:
+    """
+    Comprehensive validation of extracted invoice data.
+    Returns: (invoice_date, currency, subtotal, vat_amount, total_amount, validation_errors)
+    """
+    errors: List[str] = []
+    warnings: List[str] = []
+    
+    # 1. DATE VALIDATION
     inv_date = ensure_iso_date(data.get("invoice_date"), "invoice_date", errors)
+    if inv_date:
+        today = date.today()
+        # Check if date is in the future (more than 30 days is suspicious)
+        if inv_date > today:
+            days_ahead = (inv_date - today).days
+            if days_ahead > 30:
+                errors.append(f"Invoice date is {days_ahead} days in the future")
+            else:
+                warnings.append(f"Invoice date is {days_ahead} days in the future")
+        
+        # Check if date is too old (more than 10 years is suspicious)
+        if (today - inv_date).days > 3650:
+            errors.append(f"Invoice date is more than 10 years old")
+    
+    if data.get("due_date"):
+        due_date = ensure_iso_date(data.get("due_date"), "due_date", errors)
+        if inv_date and due_date:
+            # Due date should be after invoice date
+            if due_date < inv_date:
+                errors.append(f"Due date ({due_date}) is before invoice date ({inv_date})")
+            # Due date shouldn't be more than 1 year after invoice date
+            elif (due_date - inv_date).days > 365:
+                warnings.append(f"Due date is more than 1 year after invoice date")
+
+    # 2. CURRENCY VALIDATION
     currency = normalize_currency(data.get("currency"), errors)
 
-    # We allow validation "failures" to pass as soft errors in robust mode, 
-    # but logging them is important.
-    if errors:
-        log.warning(f"Validation warnings for {filename}: {errors}")
+    # 3. AMOUNT VALIDATION
+    try:
+        sub = q_money(data.get("subtotal") or 0)
+        vat = q_money(data.get("total_vat") or 0)
+        tot = q_money(data.get("total_amount") or 0)
+        
+        # Check for negative amounts (unless it's a credit note)
+        if sub < 0:
+            warnings.append(f"Subtotal is negative: {sub}")
+        if vat < 0:
+            warnings.append(f"VAT amount is negative: {vat}")
+        if tot < 0:
+            warnings.append(f"Total amount is negative: {tot}")
+        
+        # Validate: Subtotal + VAT = Total (with tolerance for rounding)
+        calculated_total = sub + vat
+        if not nearly_equal_money(calculated_total, tot, tol=Decimal("0.05")):
+            diff = abs(calculated_total - tot)
+            errors.append(f"Amount mismatch: Subtotal({sub}) + VAT({vat}) = {calculated_total}, but Total = {tot} (difference: {diff})")
+        
+        # Check for unreasonably large amounts (flag if > 1 million)
+        if abs(tot) > Decimal("1000000"):
+            warnings.append(f"Total amount is very large: {tot}")
+        
+    except (ValueError, TypeError, KeyError) as e:
+        errors.append(f"Error parsing amounts: {e}")
 
-    return inv_date, currency, 0, 0, 0 # Return placeholders if needed
+    # 4. VAT CALCULATION VALIDATION
+    try:
+        vat_breakdown = data.get("vat_breakdown", [])
+        if vat_breakdown:
+            # Validate VAT breakdown sums to total VAT
+            breakdown_vat_sum = Decimal("0")
+            for item in vat_breakdown:
+                if isinstance(item, dict):
+                    tax_amt = item.get("tax_amount")
+                    if tax_amt is not None:
+                        try:
+                            breakdown_vat_sum += q_money(tax_amt)
+                        except (ValueError, TypeError):
+                            pass
+            
+            if breakdown_vat_sum > 0:
+                if not nearly_equal_money(breakdown_vat_sum, vat, tol=Decimal("0.05")):
+                    errors.append(
+                        f"VAT breakdown sum ({breakdown_vat_sum}) does not match total_vat ({vat})"
+                    )
+            
+            # Validate VAT rates are reasonable
+            for item in vat_breakdown:
+                if isinstance(item, dict):
+                    rate = item.get("rate")
+                    if rate is not None and rate != "import":
+                        try:
+                            rate_val = float(rate)
+                            # Common VAT rates: 0%, 9%, 21% (Netherlands), or other EU rates
+                            common_rates = [0.0, 9.0, 21.0, 6.0, 10.0, 13.0, 19.0, 20.0, 22.0, 25.0]
+                            if rate_val < 0 or rate_val > 30:
+                                warnings.append(f"Unusual VAT rate: {rate_val}%")
+                            elif rate_val > 0 and not any(abs(rate_val - cr) < 0.1 for cr in common_rates):
+                                warnings.append(f"Non-standard VAT rate: {rate_val}%")
+                        except (ValueError, TypeError):
+                            pass
+        
+        # Validate VAT calculation: If we have subtotal and VAT rate, calculate expected VAT
+        if vat_breakdown and len(vat_breakdown) == 1:
+            item = vat_breakdown[0]
+            if isinstance(item, dict):
+                rate = item.get("rate")
+                base = item.get("base_amount")
+                if rate is not None and rate != "import" and base is not None:
+                    try:
+                        rate_val = float(rate)
+                        base_val = q_money(base)
+                        expected_vat = q_money(base_val * Decimal(str(rate_val)) / Decimal("100"))
+                        if not nearly_equal_money(expected_vat, vat, tol=Decimal("0.05")):
+                            warnings.append(
+                                f"VAT calculation mismatch: {base_val} * {rate_val}% = {expected_vat}, "
+                                f"but total_vat = {vat}"
+                            )
+                    except (ValueError, TypeError):
+                        pass
+    
+    except Exception as e:
+        warnings.append(f"Error validating VAT breakdown: {e}")
+
+    # 5. CROSS-FIELD VALIDATION
+    # Check if invoice number is present and reasonable
+    inv_num = data.get("invoice_number")
+    if not inv_num or not str(inv_num).strip():
+        warnings.append("Invoice number is missing")
+    
+    # Check if vendor/customer names are present
+    if not data.get("vendor_name") or not str(data.get("vendor_name", "")).strip():
+        warnings.append("Vendor name is missing")
+    if not data.get("customer_name") or not str(data.get("customer_name", "")).strip():
+        warnings.append("Customer name is missing")
+
+    # Log all issues
+    all_issues = errors + warnings
+    if all_issues:
+        error_msg = " | ".join([f"ERROR: {e}" for e in errors])
+        warning_msg = " | ".join([f"WARNING: {w}" for w in warnings])
+        msg_parts = []
+        if error_msg:
+            msg_parts.append(error_msg)
+        if warning_msg:
+            msg_parts.append(warning_msg)
+        log.warning(f"Validation issues for {filename}: {' | '.join(msg_parts)}")
+    
+    # Return validation errors list for confidence scoring
+    return inv_date, currency, sub, vat, tot, errors
 
 def _normalize_company_name(name: str) -> str:
-    if not name: return ""
-    name = name.lower()
-    name = re.sub(r'[^a-z0-9]', '', name)
-    return name
+    """
+    Normalizes company name for matching by:
+    - Converting to lowercase
+    - Removing all punctuation and special characters
+    - Removing common legal suffixes (B.V., BV, B.V, Ltd, Limited, etc.)
+    - Normalizing spaces
+    - Removing common stop words
+    """
+    if not name:
+        return ""
+    
+    # Convert to lowercase
+    normalized = name.casefold()
+    
+    # Remove common legal entity suffixes (case-insensitive)
+    legal_suffixes = [
+        r'\bb\.v\.?\b', r'\bbv\b', r'\bb\.v\b',
+        r'\bltd\.?\b', r'\blimited\b',
+        r'\binc\.?\b', r'\bincorporated\b',
+        r'\bllc\b', r'\bll\.?c\.?\b',
+        r'\bcorp\.?\b', r'\bcorporation\b',
+        r'\bs\.a\.?\b', r'\bsa\b',
+        r'\bs\.a\.?r\.?l\.?\b', r'\bsarl\b',
+        r'\bgmbh\b', r'\bag\b',
+        r'\bn\.?v\.?\b', r'\bnv\b',
+        r'\bspa\b', r'\bsp\.?z\.?o\.?o\.?\b',
+        r'\bsl\b', r'\bs\.?l\.?\b'
+    ]
+    
+    for suffix_pattern in legal_suffixes:
+        normalized = re.sub(suffix_pattern, '', normalized)
+    
+    # Remove common stop words that don't help with matching
+    stop_words = [r'\bthe\b', r'\ba\b', r'\ban\b', r'\band\b', r'\bor\b', r'\bof\b']
+    for stop_word in stop_words:
+        normalized = re.sub(stop_word, '', normalized)
+    
+    # Remove all punctuation, special characters, and normalize spaces
+    normalized = re.sub(r"[\s\-_/.,()\[\]{}'\"&]+", " ", normalized)
+    
+    # Remove multiple spaces and trim
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    
+    return normalized
+
+def _calculate_name_similarity(name1: str, name2: str) -> float:
+    """
+    Calculates similarity between two normalized company names.
+    Returns a score between 0.0 and 1.0.
+    """
+    if not name1 or not name2:
+        return 0.0
+    
+    n1 = _normalize_company_name(name1)
+    n2 = _normalize_company_name(name2)
+    
+    if n1 == n2:
+        return 1.0
+    
+    # Check if one is substring of another
+    if n1 in n2 or n2 in n1:
+        shorter = min(len(n1), len(n2))
+        longer = max(len(n1), len(n2))
+        return shorter / longer if longer > 0 else 0.0
+    
+    # Word-based similarity
+    words1 = set(n1.split())
+    words2 = set(n2.split())
+    
+    if not words1 or not words2:
+        return 0.0
+    
+    # Calculate Jaccard similarity
+    intersection = words1.intersection(words2)
+    union = words1.union(words2)
+    
+    if not union:
+        return 0.0
+    
+    return len(intersection) / len(union)
 
 def _split_company_list(raw: str) -> List[str]:
     if not raw: return []
     return [p.strip() for p in re.split(r"[,\n;]", raw) if p and p.strip()]
 
-# -------------------- Dynamic IBAN & Sanity Logic --------------------
-
+# ----------------------------------------------------------------------------
+# DYNAMIC HELPER 1: REGEX IBAN EXTRACTION (Fixes missing IBANs)
+# ----------------------------------------------------------------------------
 def _extract_ibans_via_regex(text: str) -> List[str]:
     """
     Finds IBANs in raw text even if LLM misses them.
     Looks for 2 letters + 2 digits + 10-30 alphanumeric.
     """
     if not text: return []
-    # Clean whitespace for better matching
+    # Clean whitespace for better matching (IBANs often have spaces)
     clean = re.sub(r'\s+', '', text)
     # Generic IBAN pattern
     matches = re.findall(r'([A-Z]{2}\d{2}[A-Z0-9]{10,30})', clean)
@@ -438,390 +937,1026 @@ def _is_same_country_code(code: str, country_name: str) -> bool:
     mapping = {
         "NL": "Netherlands", "DE": "Germany", "FR": "France", 
         "BE": "Belgium", "EG": "Egypt", "US": "United States",
-        "GB": "United Kingdom", "UK": "United Kingdom"
+        "GB": "United Kingdom", "UK": "United Kingdom", "ES": "Spain", "IT": "Italy"
     }
     c_name = mapping.get(code.upper(), "")
-    if c_name and c_name.lower() in (country_name or "").lower():
+    if c_name and c_name.lower() in country_name.lower():
         return True
     return False
 
-def _perform_sanity_check_and_swap(entry: Dict[str, Any], our_companies: List[str]) -> Dict[str, Any]:
-    """
-    Fixes LLM mix-ups where Vendor/Customer are swapped.
-    Scenario: Invoice is classified as Sales (Vendor=Us), but Vendor IBAN is foreign (e.g. Egypt).
-    This implies 'Us' is actually the payer (Customer), so we must swap.
-    """
-    current_type = entry.get("Type")
-    vendor_iban = entry.get("Vendor IBAN")
-    
-    # Only check if we think it's a Sale (Vendor matches our company)
-    if current_type == "Sales" and vendor_iban and len(vendor_iban) > 2:
-        iban_code = vendor_iban[:2].upper()
-        
-        # If Vendor IBAN is NOT Dutch (assuming we are Dutch) 
-        # AND it matches the "Customer's" country (e.g., Galina in Egypt), 
-        # Then the LLM got it backwards.
-        cust_country = entry.get("Customer Country") or ""
-        
-        # Assumption: Our company uses NL banks. If IBAN is Foreign, it's likely not us receiving money.
-        if iban_code != "NL":
-            log.warning(
-                f"Sanity Swap Triggered: Vendor IBAN ({iban_code}) is foreign but type is Sales. Swapping entities."
-            )
-            # Swap relevant fields
-            entry["Vendor Name"], entry["Customer Name"] = entry["Customer Name"], entry["Vendor Name"]
-            entry["Vendor Address"], entry["Customer Address"] = entry["Customer Address"], entry["Vendor Address"]
-            entry["Vendor Country"], entry["Customer Country"] = entry["Customer Country"], entry["Vendor Country"]
-            entry["Vendor VAT ID"], entry["Customer VAT ID"] = entry["Customer VAT ID"], entry["Vendor VAT ID"]
-            # Force type to Purchase
-            entry["Type"] = "Purchase"
-    return entry
-
-# -------------------- Classification Helpers --------------------
+# ----------------------------------------------------------------------------
+# DYNAMIC HELPER 2: SANITY CHECK & SWAP (Fixes "Galina" logic error)
+# ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# EU Country Detection & Address Parsing (Keep Original Robust Logic)
+# ----------------------------------------------------------------------------
 
 EU_COUNTRIES = {
-    "netherlands", "germany", "france", "belgium", "spain", "italy", "ireland", "austria", 
-    "portugal", "poland", "sweden", "finland", "denmark", "czech republic", "hungary",
-    "luxembourg", "bulgaria", "croatia", "cyprus", "estonia", "greece", "latvia", 
-    "lithuania", "malta", "romania", "slovakia", "slovenia"
+    # Full country names
+    "austria", "belgium", "bulgaria", "croatia", "cyprus", "czech republic", "czechia",
+    "denmark", "estonia", "finland", "france", "germany", "greece", "hungary",
+    "ireland", "italy", "latvia", "lithuania", "luxembourg", "malta", "netherlands",
+    "poland", "portugal", "romania", "slovakia", "slovenia", "spain", "sweden",
+    # Country codes
+    "at", "be", "bg", "hr", "cy", "cz", "dk", "ee", "fi", "fr", "de", "gr", "hu",
+    "ie", "it", "lv", "lt", "lu", "mt", "nl", "pl", "pt", "ro", "sk", "si", "es", "se",
+    # Alternative names
+    "nederland", "holland", "deutschland", "italia", "espana", "frankreich",
+    "belgie", "belgique"
 }
 
-def _extract_country_from_address(addr: str) -> Optional[str]:
-    if not addr: return None
-    addr_l = addr.lower()
-    # Simple check for common countries
-    for c in EU_COUNTRIES:
-        if c in addr_l: return c.title()
-    if "egypt" in addr_l: return "Egypt"
-    if "united states" in addr_l or " usa " in addr_l: return "United States"
-    if "united kingdom" in addr_l or " uk " in addr_l: return "United Kingdom"
+COMMON_COUNTRIES = {
+    # EU countries (from above) - map to themselves
+    **{country: country for country in EU_COUNTRIES if len(country) > 2},  # Full names only
+    # Non-EU countries
+    "united kingdom": "united kingdom", "uk": "united kingdom", "great britain": "united kingdom", "britain": "united kingdom",
+    "united states": "united states", "usa": "united states", "us": "united states", "america": "united states",
+    "switzerland": "switzerland", "norway": "norway", "iceland": "iceland",
+    "china": "china", "japan": "japan", "india": "india", "canada": "canada",
+    "australia": "australia", "new zealand": "new zealand", "south africa": "south africa",
+    "brazil": "brazil", "mexico": "mexico", "argentina": "argentina",
+    "egypt": "egypt", "uae": "united arab emirates", "united arab emirates": "united arab emirates", 
+    "saudi arabia": "saudi arabia", "singapore": "singapore", "hong kong": "hong kong", 
+    "south korea": "south korea", "taiwan": "taiwan", "turkey": "turkey",
+    "russia": "russia", "ukraine": "ukraine"
+}
+
+def _extract_country_from_address(address: str) -> Optional[str]:
+    """
+    Extracts country name or code from an address string.
+    Returns the country name if found, None otherwise.
+    Handles both EU and non-EU countries.
+    """
+    if not address:
+        return None
+    
+    address_lower = address.lower()
+    
+    # City-to-country mapping for well-known cities
+    city_to_country = {
+        # Ireland
+        "galway": "Ireland", "dublin": "Ireland", "cork": "Ireland", "limerick": "Ireland",
+        "waterford": "Ireland", "kilkenny": "Ireland", "belfast": "Ireland",
+        # UK
+        "london": "United Kingdom", "manchester": "United Kingdom", "birmingham": "United Kingdom",
+        "glasgow": "United Kingdom", "edinburgh": "United Kingdom", "liverpool": "United Kingdom",
+        # Other well-known cities
+        "amsterdam": "Netherlands", "rotterdam": "Netherlands", "the hague": "Netherlands",
+        "paris": "France", "lyon": "France", "marseille": "France",
+        "berlin": "Germany", "munich": "Germany", "hamburg": "Germany",
+        "madrid": "Spain", "barcelona": "Spain", "valencia": "Spain",
+        "rome": "Italy", "milan": "Italy", "naples": "Italy",
+    }
+    
+    # Check for cities first
+    for city, country in city_to_country.items():
+        if city in address_lower:
+            return country
+    
+    # First, check for common country names (prioritize longer/more specific names first)
+    # Sort by length descending to match "United Kingdom" before "Kingdom"
+    country_names = sorted(COMMON_COUNTRIES.keys(), key=len, reverse=True)
+    
+    for country_name in country_names:
+        # Use word boundaries to avoid partial matches
+        pattern = r'\b' + re.escape(country_name) + r'\b'
+        if re.search(pattern, address_lower):
+            # Get normalized country name
+            normalized = COMMON_COUNTRIES[country_name]
+            # Return properly capitalized country name
+            if normalized == "united kingdom":
+                return "United Kingdom"
+            elif normalized == "united states":
+                return "United States"
+            elif normalized == "united arab emirates":
+                return "United Arab Emirates"
+            else:
+                return normalized.title()
+    
+    # Check for country codes (usually at the end of address, after postal code)
+    # Pattern: postal code + country code (e.g., "1234 AB NL" or "75001 FR")
+    country_code_pattern = r'\b([a-z]{2})\b'
+    matches = re.findall(country_code_pattern, address_lower)
+    
+    # Check matches against known country codes (check from end, country usually at end)
+    code_to_country = {
+        "at": "Austria", "be": "Belgium", "bg": "Bulgaria", "hr": "Croatia",
+        "cy": "Cyprus", "cz": "Czech Republic", "dk": "Denmark", "ee": "Estonia",
+        "fi": "Finland", "fr": "France", "de": "Germany", "gr": "Greece",
+        "hu": "Hungary", "ie": "Ireland", "it": "Italy", "lv": "Latvia",
+        "lt": "Lithuania", "lu": "Luxembourg", "mt": "Malta", "nl": "Netherlands",
+        "pl": "Poland", "pt": "Portugal", "ro": "Romania", "sk": "Slovakia",
+        "si": "Slovenia", "es": "Spain", "se": "Sweden",
+        "gb": "United Kingdom", "uk": "United Kingdom", "us": "United States", "ch": "Switzerland", "eg": "Egypt"
+    }
+    
+    for match in reversed(matches):
+        if match in code_to_country:
+            return code_to_country[match]
+    
     return None
 
-def _is_eu_country(c: Optional[str]) -> bool:
-    return (c or "").lower() in EU_COUNTRIES
+# -------------------- Dutch VAT Box Mapping --------------------
 
-def _is_nl_country(c: Optional[str]) -> bool:
-    return (c or "").lower() in ["netherlands", "nl", "nederland", "holland"]
-
-def _determine_goods_services_indicator(llm_data, text):
-    return llm_data.get("goods_services_indicator", "services")
-
-def _classify_type(register_entry: Dict[str, Any], our_companies_list: List[str]) -> str:
-    v = _normalize_company_name(register_entry.get("Vendor Name"))
-    c = _normalize_company_name(register_entry.get("Customer Name"))
-    
-    for comp in our_companies_list:
-        norm = _normalize_company_name(comp)
-        if norm and norm in v: return "Sales"
-        if norm and norm in c: return "Purchase"
-        
-    return "Unclassified"
-
-def _determine_invoice_subcategory(type_str, v_addr, c_addr, vat_pct, text):
-    v_country = _extract_country_from_address(v_addr)
-    c_country = _extract_country_from_address(c_addr)
-    
-    if type_str == "Sales":
-        if _is_nl_country(c_country): return "Standard 21%" if vat_pct == 21 else "Domestic Sales"
-        if _is_eu_country(c_country): return "Sales to EU Countries"
-        return "Sales to Non-EU Countries"
-        
-    if type_str == "Purchase":
-        if _is_nl_country(v_country): return "Domestic Purchase"
-        if _is_eu_country(v_country): return "Purchase from EU Countries"
-        return "Purchase from Non-EU Countries (Import)"
-        
-    return "Unclassified"
-
-# Dutch VAT return boxes (official view)
-DUTCH_VAT_CATEGORY_DESCRIPTIONS = {
-    "1a": "Sales taxed at standard rate (21%)",
-    "1b": "Sales taxed at reduced rate (9%)",
-    "2a": "Domestic reverse-charge supplies (NL customer)",
-    "3a": "Intra-EU supplies of goods to VAT-registered customers (0%)",
-    "3b": "Intra-EU supplies of services to VAT-registered customers (0%, reverse charge)",
-    "4a": "Purchases of goods from EU countries",
-    "4b": "Purchases of services from EU countries",
-    "5a": "Input VAT on domestic purchases (Dutch VAT)",
+DUTCH_VAT_CATEGORY_DESCRIPTIONS: Dict[str, str] = {
+    "1a": "Domestic sales taxed at 21%",
+    "1b": "Domestic sales taxed at 9%",
+    "1e": "Zero-rated exports (non-EU)",
+    "2a": "Domestic reverse-charge sales",
+    "3a": "Intra-EU supply of goods (B2B, 0%)",
+    "3b": "Intra-EU supply of services (B2B, 0%)",
+    "4a": "Intra-EU acquisition of goods",
+    "4b": "Intra-EU acquisition of services",
+    "5a": "Dutch input VAT on domestic purchases",
+    "NO_TURNOVER_BOX": "Non-EU purchase of services (reverse charge; no turnover box)",
+    "OUTSIDE_SCOPE": "Import of goods handled via customs (outside VAT turnover boxes)",
+    "UNDETERMINED": "Unable to classify – missing or ambiguous data",
 }
 
-def _determine_dutch_vat_return_category(invoice_type, vendor_country, customer_country, **kwargs):
+def _determine_dutch_vat_return_category(
+    invoice_type: str,
+    vendor_country: Optional[str],
+    customer_country: Optional[str],
+    vat_percentage: Optional[float],
+    vat_amount: Optional[float],
+    goods_services_indicator: Optional[str],
+    reverse_charge_applied: bool,
+    customer_vat_id: Optional[str],
+    vendor_vat_id: Optional[str],
+    vat_category: Optional[str],
+) -> Tuple[str, str]:
     """
-    Map each transaction into a Dutch VAT return box.
+    Map an invoice to a Dutch VAT return box using  rule-based logic.
 
-    We use:
-      - invoice_type: "Sales" or "Purchase"
-      - vendor_country / customer_country
-      - vat_pct: effective VAT rate (float or None)
-      - vat_amount: VAT amount
-      - goods_services: "goods" / "services" / None
-      - vat_category: high-level LLM label ("standard", "zero-rated", "reverse-charge", "out-of-scope", "import-vat")
-      - customer_vat_id / vendor_vat_id: presence of VAT ID as B2B signal
-
-    For now we support the main boxes: 1a, 1b, 2a, 3a, 3b, 4a, 4b, 5a.
-    Anything that does not cleanly match one of these returns "" (no box).
+    Returns:
+        (vat_box, reasoning)
+        vat_box ∈ {"1a","1b","1e","2a","3a","3b","4a","4b","5a","UNDETERMINED"}
     """
-    vat_pct = kwargs.get("vat_pct")
-    vat_amount = kwargs.get("vat_amount")
-    goods_services = (kwargs.get("goods_services") or "").lower()
-    vat_category = (kwargs.get("vat_category") or "").lower()
-    customer_vat_id = kwargs.get("customer_vat_id") or ""
-    vendor_vat_id = kwargs.get("vendor_vat_id") or ""
+    try:
+        inv_type = (invoice_type or "").strip().lower()
+        supplier_country = vendor_country  # vendor is the supplier in our register
+        customer_country_norm = customer_country
+        
+        log.debug(f"VAT mapping: type={inv_type}, vendor_country={vendor_country}, customer_country={customer_country}, vat_pct={vat_percentage}, goods_services={goods_services_indicator}")
 
-    has_customer_vat = bool(str(customer_vat_id).strip())
-    has_vendor_vat = bool(str(vendor_vat_id).strip())
+        # Normalise helpers
+        def _approx_rate(rate: Optional[float], target: float) -> bool:
+            if rate is None:
+                return False
+            try:
+                return abs(float(rate) - target) < 0.2
+            except Exception:
+                return False
 
-    is_cust_nl = _is_nl_country(customer_country)
-    is_vend_nl = _is_nl_country(vendor_country)
-    is_cust_eu = _is_eu_country(customer_country) and not is_cust_nl
-    is_vend_eu = _is_eu_country(vendor_country) and not is_vend_nl
-    is_cust_non_eu = bool(customer_country) and not is_cust_nl and not is_cust_eu
+        def _has_vat_number(v: Optional[str]) -> bool:
+            return bool(str(v or "").strip())
 
-    # Helper: compare VAT % with tolerance
-    def _approx(x, target):
-        if x is None:
-            return False
-        try:
-            return abs(float(x) - target) < 0.2
-        except Exception:
-            return False
+        # SALES LOGIC ----------------------------------------------------------
+        if inv_type == "sales":
+            # Guard: we need a customer country
+            if not customer_country:
+                return "UNDETERMINED", "Sales invoice without customer country"
 
-    # SALES LOGIC
-    if invoice_type == "Sales":
-        # Domestic NL customer
-        if is_cust_nl:
-            # 1a – NL customer, 21% VAT
-            if _approx(vat_pct, 21.0):
-                return "1a"
-            # 1b – NL customer, 9% VAT
-            if _approx(vat_pct, 9.0):
-                return "1b"
-            # 2a – Domestic reverse-charge
-            # We treat any NL customer + vat_category == reverse-charge as 2a
-            if vat_category == "reverse-charge":
-                return "2a"
-            # Other domestic NL patterns (0%, exempt etc.) not mapped to a specific box here.
-            return ""
+            is_cust_nl = _is_nl_country(customer_country)
+            is_cust_eu = _is_eu_country(customer_country) and not is_cust_nl
+            is_cust_non_eu = not _is_eu_country(customer_country) and not is_cust_nl
+            rate_is_0 = _approx_rate(vat_percentage, 0.0)
 
-        # EU (not NL) customer – intra-EU B2B
-        if is_cust_eu and has_customer_vat:
-            # 3a – goods, 0% VAT
-            if goods_services == "goods" and (vat_pct is None or _approx(vat_pct, 0.0)):
-                return "3a"
-            # 3b – services, 0% VAT (reverse charge applies)
-            if goods_services == "services" and (vat_pct is None or _approx(vat_pct, 0.0)):
-                return "3b"
-            # If we can't clearly distinguish goods/services we leave it blank.
-            return ""
+            # 1a – Domestic sales taxed at 21%
+            if is_cust_nl and _approx_rate(vat_percentage, 21.0) and not reverse_charge_applied:
+                return "1a", "Sales to NL customer, 21% VAT, no reverse charge"
 
-        # Exports to non-EU are typically zero-rated but go in a different box (1c)
-        # which we do not model explicitly here, so we return "".
-        if is_cust_non_eu and (vat_pct is None or _approx(vat_pct, 0.0)):
-            return ""
+            # 1b – Domestic sales taxed at 9%
+            if is_cust_nl and _approx_rate(vat_percentage, 9.0) and not reverse_charge_applied:
+                return "1b", "Sales to NL customer, 9% VAT, no reverse charge"
 
-        # Anything else on the sales side is left unmapped for now.
-        return ""
+            # 1e – Zero-rated exports (non‑EU)
+            if is_cust_non_eu and rate_is_0:
+                return "1e", "Sales to non‑EU customer with 0% VAT"
 
-    # PURCHASE LOGIC
-    if invoice_type == "Purchase":
-        # 5a – Domestic purchases with Dutch VAT (vendor NL + VAT > 0)
-        if is_vend_nl:
-            if (vat_pct is not None and float(vat_pct) > 0.01) or (vat_amount is not None and float(vat_amount) > 0.0):
-                return "5a"
-            return ""
+            # 2a – Domestic reverse‑charge sales
+            if is_cust_nl and reverse_charge_applied:
+                return "2a", "Sales to NL customer with reverse charge applied"
 
-        # EU supplier (not NL) – intra-EU acquisitions
-        if is_vend_eu:
-            if goods_services == "goods":
-                return "4a"
-            if goods_services == "services":
-                return "4b"
-            # If goods/services unclear, we still leave the box empty.
-            return ""
+            # 3a / 3b – Intra‑EU B2B supplies
+            if is_cust_eu:
+                has_vat = _has_vat_number(customer_vat_id)
+                indicator = (goods_services_indicator or "").lower()
+                
+                # Classify based on goods/services and rate, even if VAT number is missing
+                if indicator == "goods" and rate_is_0:
+                    if has_vat:
+                        return "3a", "Intra‑EU supply of goods (B2B, 0%)"
+                    else:
+                        return "3a", "Intra‑EU supply of goods (B2B, 0%) - WARNING: Customer VAT number missing but transaction appears to be EU B2B"
+                
+                if indicator == "services" and rate_is_0:
+                    if has_vat:
+                        return "3b", "Intra‑EU supply of services (B2B, 0%)"
+                    else:
+                        return "3b", "Intra‑EU supply of services (B2B, 0%) - WARNING: Customer VAT number missing but transaction appears to be EU B2B"
+                
+                # EU but unclear goods/services or VAT rate
+                if not has_vat:
+                    return "UNDETERMINED", "EU sales but missing customer VAT number and unclear goods/services or rate"
+                return "UNDETERMINED", "EU sales with VAT ID but unclear goods/services or rate"
 
-        # Non-EU purchases: usually handled as imports; we don't force them into 4a/4b.
-        return ""
+            # Special edge case: NL customer, 0% VAT and no reverse‑charge → ambiguous
+            if is_cust_nl and rate_is_0 and not reverse_charge_applied:
+                return "UNDETERMINED", "Sales to NL customer with 0% VAT and no reverse charge"
 
-    # Anything else (Unclassified) → no box
-    return ""
+            # Anything else on the sales side cannot be safely boxed
+            return "UNDETERMINED", "Sales invoice does not meet any box criteria"
 
+        # PURCHASE LOGIC -------------------------------------------------------
+        if inv_type == "purchase":
+            if not supplier_country:
+                return "UNDETERMINED", "Purchase invoice without supplier country"
 
-def _detect_credit_note(invoice_text: str) -> bool:
+            is_suppl_nl = _is_nl_country(supplier_country)
+            is_suppl_eu = _is_eu_country(supplier_country) and not is_suppl_nl
+            indicator = (goods_services_indicator or "").lower()
+
+            # 5a – Dutch input VAT on domestic purchases
+            try:
+                vat_amt_val = float(vat_amount or 0.0)
+            except Exception:
+                vat_amt_val = 0.0
+            if is_suppl_nl and vat_amt_val > 0.0:
+                return "5a", "Domestic purchase from NL supplier with input VAT"
+
+            # 4a – Intra‑EU acquisition of goods (or non-EU goods via customs)
+            if not is_suppl_nl and indicator == "goods":
+                if is_suppl_eu:
+                    return "4a", "Purchase of goods from EU supplier (non‑NL)"
+                else:
+                    # Non-EU goods handled via customs
+                    return (
+                        "OUTSIDE_SCOPE",
+                        "Import of goods handled via customs (import VAT), not via Dutch VAT turnover boxes."
+                    )
+
+            # 4b – Services from outside Netherlands (EU or non-EU) - reverse charge
+            # According to Dutch VAT rules: "Diensten uit het buitenland aan u verricht"
+            # This includes both EU and non-EU services when reverse charge applies
+            if not is_suppl_nl and indicator == "services":
+                rate_is_0 = _approx_rate(vat_percentage, 0.0)
+                if rate_is_0 or vat_amt_val == 0.0:
+                    if is_suppl_eu:
+                        return "4b", "Purchase of services from EU supplier (non‑NL) - reverse charge"
+                    else:
+                        # Non-EU services also go to 4b when reverse charge applies
+                        return "4b", "Purchase of services from non-EU supplier - reverse charge (Article 196)"
+
+            # Everything else cannot be safely and legally inferred
+            return "UNDETERMINED", "Purchase invoice could not be classified with available data"
+
+        # Any other type → cannot classify
+        return "UNDETERMINED", f"Unsupported invoice_type '{invoice_type}'"
+    
+    except Exception as e:
+        log.error(f"VAT category determination error: {e}", exc_info=True)
+        return "UNDETERMINED", f"Error during VAT classification: {str(e)}"
+    
+    # Final safety net - should never reach here, but ensures we always return a tuple
+    log.error("VAT mapping function reached end without returning - this should never happen")
+    return "UNDETERMINED", "Internal error: function did not return a value"
+
+def _is_eu_country(country: Optional[str]) -> bool:
     """
-    Heuristic to detect if the document is a credit note instead of a normal invoice.
-
-    We look for common keywords in the raw invoice text:
-      - "credit note", "creditnote", "credit memo", "crediteurnota"
-
-    If none of these are present we assume it is a normal invoice.
+    Returns True if the given country is an EU member, based on a
+    normalised (stripped, lower-cased) country name or 2‑letter code.
     """
-    if not invoice_text:
+    if not country:
         return False
-    txt = invoice_text.lower()
+    return country.strip().lower() in EU_COUNTRIES
+
+def _is_nl_country(country: Optional[str]) -> bool:
+    """
+    Returns True if the country represents the Netherlands (NL),
+    with robust normalisation to tolerate extra spaces or variants.
+    """
+    if not country:
+        return False
+    country_lower = country.strip().lower()
+    return (
+        country_lower == "netherlands"
+        or country_lower == "nl"
+        or country_lower == "nederland"
+        or country_lower == "holland"
+    )
+
+def _determine_goods_services_indicator(llm_data: Dict[str, Any], invoice_text: str = "") -> Optional[str]:
+    # First check if LLM extracted it
+    indicator = llm_data.get("goods_services_indicator")
+    if indicator and indicator.lower() in ["goods", "services"]:
+        return indicator.lower()
+    
+    # Fallback: analyze line items and description
+    text_lower = (invoice_text or "").lower()
+    description = ""
+    if llm_data.get("line_items"):
+        descriptions = [item.get("description", "") for item in llm_data.get("line_items", [])]
+        description = " ".join(descriptions).lower()
+    
+    combined_text = (text_lower + " " + description).lower()
+    
+    # Goods indicators
+    goods_keywords = [
+        "product", "products", "item", "items", "goods", "merchandise",
+        "physical", "tangible", "shipment", "delivery", "warehouse",
+        "stock", "inventory", "material", "materials", "equipment",
+        "hardware", "component", "parts", "supplies"
+    ]
+    
+    # Services indicators
+    services_keywords = [
+        "service", "services", "consulting", "consultancy", "support",
+        "maintenance", "repair", "installation", "training", "advice",
+        "advisory", "software license", "licensing", "subscription",
+        "professional", "expertise", "expert", "assistance", "help",
+        "management", "administration", "processing", "handling"
+    ]
+    
+    goods_count = sum(1 for keyword in goods_keywords if keyword in combined_text)
+    services_count = sum(1 for keyword in services_keywords if keyword in combined_text)
+    
+    if goods_count > services_count and goods_count > 0:
+        return "goods"
+    elif services_count > goods_count and services_count > 0:
+        return "services"
+    
+    # Default to services for B2B if unclear
+    return "services"
+
+def _determine_invoice_subcategory(
+    invoice_type: str,
+    vendor_address: Optional[str],
+    customer_address: Optional[str],
+    vat_percentage: Optional[float],
+    invoice_text: str = ""
+) -> str:
+    """
+    Determines the invoice subcategory based on:
+    - Invoice type (Sales/Purchase)
+    - Vendor and customer addresses (EU vs non-EU)
+    - VAT rate (21%, 9%, etc.)
+    """
+    # Extract countries from addresses
+    vendor_country = _extract_country_from_address(vendor_address) if vendor_address else None
+    customer_country = _extract_country_from_address(customer_address) if customer_address else None
+    
+    # Check for import VAT indicators in invoice text
+    import_vat_keywords = [
+        "import vat", "importvat", "import btw", "importbtw",
+        "invoer btw", "invoerbtw", "import tax", "customs"
+    ]
+    is_import_vat = False
+    if invoice_text:
+        text_lower = invoice_text.lower()
+        is_import_vat = any(keyword in text_lower for keyword in import_vat_keywords)
+    
+    # Classify based on invoice type
+    if invoice_type == "Sales":
+        # For sales invoices, check customer country
+        if customer_country:
+            is_customer_eu = _is_eu_country(customer_country)
+            
+            # Check VAT rate for subcategory
+            if vat_percentage is not None:
+                vat_rate = float(vat_percentage)
+                # Standard 21% rate
+                if abs(vat_rate - 21.0) < 0.1 or (20.0 <= vat_rate <= 22.0):
+                    if is_customer_eu:
+                        return "Standard 21% - Sales to EU Countries"
+                    else:
+                        return "Standard 21% - Sales to Non-EU Countries"
+                # Reduced 9% rate
+                elif abs(vat_rate - 9.0) < 0.1 or (8.0 <= vat_rate <= 10.0):
+                    if is_customer_eu:
+                        return "Reduced Rate 9% - Sales to EU Countries"
+                    else:
+                        return "Reduced Rate 9% - Sales to Non-EU Countries"
+                # Other rates
+                else:
+                    if is_customer_eu:
+                        return f"VAT {vat_rate}% - Sales to EU Countries"
+                    else:
+                        return f"VAT {vat_rate}% - Sales to Non-EU Countries"
+            else:
+                # No VAT rate, classify by country only
+                if is_customer_eu:
+                    return "Sales to EU Countries"
+                else:
+                    return "Sales to Non-EU Countries"
+        else:
+            # No customer country found, use VAT rate if available
+            if vat_percentage is not None:
+                vat_rate = float(vat_percentage)
+                if abs(vat_rate - 21.0) < 0.1 or (20.0 <= vat_rate <= 22.0):
+                    return "Standard 21%"
+                elif abs(vat_rate - 9.0) < 0.1 or (8.0 <= vat_rate <= 10.0):
+                    return "Reduced Rate 9%"
+                else:
+                    return f"VAT {vat_rate}%"
+            return "Sales - Country Unknown"
+    
+    elif invoice_type == "Purchase":
+        # For purchase invoices, check vendor country
+        if vendor_country:
+            is_vendor_eu = _is_eu_country(vendor_country)
+            is_vendor_nl = _is_nl_country(vendor_country)
+            
+            if is_vendor_eu and not is_vendor_nl:
+                return "Purchase from EU Countries"
+            elif is_vendor_nl:
+                return "Purchase from NL Countries"
+            else:
+                # Non-EU purchase - check if it's import VAT
+                if is_import_vat or (vat_percentage is not None and vat_percentage > 0):
+                    return "Purchase from Non-EU Countries (Import VAT)"
+                else:
+                    return "Purchase from Non-EU Countries"
+        else:
+            # No vendor country found, check for import VAT indicators
+            if is_import_vat:
+                return "Purchase from Non-EU Countries (Import VAT)"
+            return "Purchase - Country Unknown"
+    
+    # Unclassified invoices
+    return "Unclassified"
+
+
+
+def _set_icp_fields_for_nl(register_entry: Dict[str, Any]) -> Dict[str, Any]:
+    # Defaults
+    register_entry["ICP Return Required"] = "No"
+    register_entry["ICP Reporting Category"] = ""
+
+    invoice_type = register_entry.get("Type")
+    if invoice_type != "Sales":
+        return register_entry
+
+    counterparty_country = register_entry.get("Customer Country")
+    counterparty_vat_number = register_entry.get("Customer VAT ID")
+
+    if not counterparty_country:
+        return register_entry
+
+    # Counterparty must be in EU but not Netherlands
+    if not _is_eu_country(counterparty_country) or _is_nl_country(counterparty_country):
+        return register_entry
+
+    # B2B only – require a non‑empty VAT number
+    if not counterparty_vat_number or not str(counterparty_vat_number).strip():
+        return register_entry
+
+    # At this point we know: Sales + EU (non‑NL) + VAT ID present → ICP relevant.
+    indicator = (register_entry.get("Goods Services Indicator") or "").lower()
+    if indicator == "goods":
+        register_entry["ICP Return Required"] = "Yes"
+        register_entry["ICP Reporting Category"] = "Intra-EU supply of goods (B2B)"
+    elif indicator == "services":
+        register_entry["ICP Return Required"] = "Yes"
+        register_entry["ICP Reporting Category"] = "Intra-EU supply of services (B2B, reverse charge)"
+    else:
+        register_entry["ICP Return Required"] = "Yes"
+        register_entry["ICP Reporting Category"] = "Intra-EU B2B supply (goods/services unclear)"
+
+    return register_entry
+
+def _derive_vat_rate_percent(llm_data: Dict[str, Any]) -> Optional[float]:
+    # look in vat_breakdown
+    for v in (llm_data.get("vat_breakdown") or []):
+        r = v.get("rate")
+        if isinstance(r, (int, float)):
+            try:
+                return float(r)
+            except Exception:
+                pass
+    # fallback based on category
+    vcat = (llm_data.get("vat_category") or "").strip().lower()
+    if vcat in {"reverse-charge", "out-of-scope", "zero-rated"}:
+        return 0.0
+    return None
+
+def _is_credit_note_simple(llm_data: Dict[str, Any], invoice_text: str) -> bool:
+    """
+    Detect whether the document is a credit note.
+
+    Logic:
+    1. If LLM explicitly says document_type contains 'credit' → treat as credit note.
+    2. Otherwise, look for common credit‑note keywords in the raw text.
+    """
+    doc_type = (llm_data.get("document_type") or "").strip().lower()
+    if "credit" in doc_type:
+        return True
+
+    text = (invoice_text or "").lower()
+    if not text:
+        return False
+
     keywords = [
         "credit note",
         "creditnote",
         "credit memo",
+        "creditmemo",
         "crediteurnota",
+        "avoir",
     ]
-    return any(k in txt for k in keywords)
-
-def _set_icp_fields_for_nl(entry):
-    # Only Sales to EU (not NL) require ICP
-    if entry["Type"] == "Sales":
-        cust_country = entry.get("Customer Country")
-        if _is_eu_country(cust_country) and not _is_nl_country(cust_country):
-            entry["ICP Return Required"] = "Yes"
-            entry["ICP Reporting Category"] = "Intra-EU supply"
-        else:
-            entry["ICP Return Required"] = "No"
-    else:
-        entry["ICP Return Required"] = "No"
-    return entry
-
-# -------------------- Main mapping --------------------
+    return any(kw in text for kw in keywords)
 
 def _map_llm_output_to_register_entry(llm_data: Dict[str, Any]) -> Dict[str, Any]:
+    description = ""
+    if llm_data.get("line_items"):
+        raw_desc = llm_data["line_items"][0].get("description", "") or ""
+        description = _translate_to_english_if_dutch(raw_desc)
+
+    vat_percentage = _derive_vat_rate_percent(llm_data)
     invoice_text = llm_data.get("_invoice_text", "")
+    is_credit = _is_credit_note_simple(llm_data, invoice_text)
+
+    # Heuristic confidence score (includes validation errors if available)
+    validation_errors = llm_data.get("_validation_errors", [])
+    extraction_confidence_level, extraction_confidence_reason = _estimate_extraction_confidence(
+        invoice_text, llm_data, validation_errors
+    )
     
-    # DYNAMIC IBAN FIX:
-    # If LLM returns null vendor_iban, try regex
+    goods_services_indicator = _determine_goods_services_indicator(llm_data, invoice_text)
+    
+    vat_category = (llm_data.get("vat_category") or "").strip().lower()
+    invoice_text_lower = (invoice_text or "").lower()
+    reverse_charge_keywords = [
+        "reverse charge", "reverse-charge", "reversecharge",
+        "btw verlegd", "btwverlegd", "vat verlegd", "vatverlegd",
+        "omgekeerde heffing", "omgekeerdeheffing"
+    ]
+    reverse_charge_applied = (
+        vat_category == "reverse-charge" or 
+        any(keyword in invoice_text_lower for keyword in reverse_charge_keywords)
+    )
+
+    vendor_address = llm_data.get("vendor_address")
+    customer_address = llm_data.get("customer_address")
+    vendor_country = _extract_country_from_address(vendor_address) if vendor_address else None
+    customer_country = _extract_country_from_address(customer_address) if customer_address else None
+    
+    reverse_charge_note = None
+    if reverse_charge_applied and invoice_text:
+        reverse_charge_patterns = [
+            r"(?i)(?:reverse\s+charge|btw\s+verlegd|vat\s+verlegd|omgekeerde\s+heffing)[^.]*",
+            r"(?i)vat[^.]*(?:verlegd|reverse)[^.]*",
+        ]
+        for pattern in reverse_charge_patterns:
+            match = re.search(pattern, invoice_text)
+            if match:
+                reverse_charge_note = match.group(0).strip()
+                break
+
+    # DYNAMIC INSERTION: IBAN Fallback
     vendor_iban = llm_data.get("vendor_iban")
     if not vendor_iban:
         ibans = _extract_ibans_via_regex(invoice_text)
         if ibans:
-            vendor_iban = ibans[0] # Best guess
+            vendor_iban = ibans[0] # Best guess from regex
             log.info(f"LLM missed IBAN. Regex recovered: {vendor_iban}")
 
-    # Is this a credit note?
-    is_credit_note = _detect_credit_note(invoice_text)
+    # Core amounts (ensure credit notes are negative)
+    nett_amount = float(q_money(llm_data.get("subtotal") or 0.0))
+    vat_amount = float(q_money(llm_data.get("total_vat") or 0.0))
+    gross_amount = float(q_money(llm_data.get("total_amount") or 0.0))
 
-    # Derive description
-    desc = ""
-    if llm_data.get("line_items"):
-        desc = llm_data["line_items"][0].get("description", "")
-
-    vat_pct = None
-    if llm_data.get("vat_breakdown"):
-        vat_pct = llm_data["vat_breakdown"][0].get("rate")
-
-    # Amounts (convert to negative for credit notes if currently positive)
-    nett = float(q_money(llm_data.get("subtotal") or 0))
-    vat_amt = float(q_money(llm_data.get("total_vat") or 0))
-    gross = float(q_money(llm_data.get("total_amount") or 0))
-    if is_credit_note:
-        if nett > 0:
-            nett = -nett
-        if vat_amt > 0:
-            vat_amt = -vat_amt
-        if gross > 0:
-            gross = -gross
+    if is_credit:
+        if nett_amount > 0:
+            nett_amount = -nett_amount
+        if vat_amount > 0:
+            vat_amount = -vat_amount
+        if gross_amount > 0:
+            gross_amount = -gross_amount
 
     return {
         "Date": llm_data.get("invoice_date"),
         "Invoice Number": llm_data.get("invoice_number"),
-        "Type": "Unclassified",
-        "Document Type": "Credit Note" if is_credit_note else "Invoice",
+        "Type": "Unclassified",  # Will be set by _classify_type
         "Vendor Name": llm_data.get("vendor_name"),
         "Vendor VAT ID": llm_data.get("vendor_vat_id"),
-        "Vendor Country": _extract_country_from_address(llm_data.get("vendor_address")),
-        "Vendor Address": llm_data.get("vendor_address"),
-        "Vendor IBAN": vendor_iban,
+        "Vendor Country": vendor_country,
+        "Vendor Address": vendor_address,
+        "Vendor IBAN": vendor_iban,  # Updated with regex fallback
         "Customer Name": llm_data.get("customer_name"),
         "Customer VAT ID": llm_data.get("customer_vat_id"),
-        "Customer Country": _extract_country_from_address(llm_data.get("customer_address")),
-        "Customer Address": llm_data.get("customer_address"),
+        "Customer Country": customer_country,
+        "Customer Address": customer_address,
         "Customer IBAN": llm_data.get("customer_iban"),
-        "Description": desc,
-        "Nett Amount": nett,
-        "VAT %": vat_pct,
-        "VAT Amount": vat_amt,
-        "Gross Amount": gross,
+        "Description": description,
+        "Nett Amount": nett_amount,
+        "VAT %": vat_percentage,
+        "VAT Amount": vat_amount,
+        "Gross Amount": gross_amount,
         "Currency": (llm_data.get("currency") or "EUR"),
         "VAT Category": llm_data.get("vat_category"),
-        "Goods Services Indicator": llm_data.get("goods_services_indicator"),
+        "Reverse Charge Applied": reverse_charge_applied,
+        "Reverse Charge Note": reverse_charge_note,
+        "Goods Services Indicator": goods_services_indicator,
+        "Subcategory": "Unclassified",
+        "Dutch VAT Return Category": None,
+        "ICP Return Required": "No",
+        "ICP Reporting Category": "",
+        "Extraction Confidence": extraction_confidence_level,
+        "Extraction Confidence Reason": extraction_confidence_reason,
+        "Due Date": llm_data.get("due_date"),
+        "Payment Terms": llm_data.get("payment_terms"),
+        "Notes": llm_data.get("notes"),
         "Full_Extraction_Data": llm_data
     }
 
-def _classify_and_set_subcategory(entry: Dict[str, Any], our_companies: List[str]) -> Dict[str, Any]:
-    # 1. Initial Classification
-    entry["Type"] = _classify_type(entry, our_companies)
-    
-    # 2. SANITY CHECK & SWAP (Dynamic Fix)
-    entry = _perform_sanity_check_and_swap(entry, our_companies)
-    
-    # 3. Subcategory
-    entry["Subcategory"] = _determine_invoice_subcategory(
-        entry["Type"], 
-        entry.get("Vendor Address"), 
-        entry.get("Customer Address"), 
-        entry.get("VAT %"),
-        ""
-    )
-    
-    # 4. VAT Return Category
-    entry["Dutch VAT Return Category"] = _determine_dutch_vat_return_category(
-        entry["Type"],
-        entry.get("Vendor Country"),
-        entry.get("Customer Country"),
-        vat_pct=entry.get("VAT %"),
-        vat_amount=entry.get("VAT Amount"),
-        goods_services=entry.get("Goods Services Indicator"),
-        vat_category=entry.get("VAT Category"),
-        customer_vat_id=entry.get("Customer VAT ID"),
-        vendor_vat_id=entry.get("Vendor VAT ID"),
-    )
-    entry["Dutch VAT Return Category Description"] = DUTCH_VAT_CATEGORY_DESCRIPTIONS.get(entry["Dutch VAT Return Category"], "")
-    
-    # 5. ICP
-    entry = _set_icp_fields_for_nl(entry)
-    
-    # Confidence
-    conf, reason = _estimate_extraction_confidence("", entry["Full_Extraction_Data"])
-    entry["Extraction Confidence"] = conf
-    entry["Extraction Confidence Reason"] = reason
-    
-    return entry
+def _classify_type(register_entry: Dict[str, Any], our_companies_list: List[str]) -> str:
+    """
+    Decide if an invoice is **Purchase** or **Sales** based on where our company appears.
 
-def _convert_to_eur_fields(entry: dict, enabled: bool = True) -> dict:
-    if not enabled: return entry
+    Priority:
+    1. If our name only matches the **customer**  → Purchase
+    2. If our name only matches the **vendor**    → Sales
+    3. If it matches **both**, compare similarity; if still close, prefer Sales
+    4. If nothing matches confidently             → Unclassified (country logic may fix later)
+      """
+    vendor_name = register_entry.get("Vendor Name") or ""
+    customer_name = register_entry.get("Customer Name") or ""
+
+    if not vendor_name and not customer_name:
+        log.warning("Both vendor and customer names are empty - cannot classify")
+        return "Unclassified"
+
+    v_norm = _normalize_company_name(vendor_name)
+    c_norm = _normalize_company_name(customer_name)
+    our_norms = [_normalize_company_name(x) for x in our_companies_list if x]
+
+    if not our_norms:
+        return "Unclassified"
+
+    vendor_scores: List[float] = []
+    customer_scores: List[float] = []
+
+    for our_company in our_norms:
+        if not our_company:
+            continue
+        
+        # Exact / substring match on normalized names
+        if our_company in c_norm:
+            customer_scores.append(len(our_company) / max(1, len(c_norm)))
+        if our_company in v_norm:
+            vendor_scores.append(len(our_company) / max(1, len(v_norm)))
+
+        # Fuzzy similarity on raw names
+        cust_sim = _calculate_name_similarity(our_company, customer_name)
+        vend_sim = _calculate_name_similarity(our_company, vendor_name)
+        if cust_sim >= 0.6:
+            customer_scores.append(cust_sim)
+        if vend_sim >= 0.6:
+            vendor_scores.append(vend_sim)
+
+    best_cust = max(customer_scores) if customer_scores else 0.0
+    best_vend = max(vendor_scores) if vendor_scores else 0.0
+
+    # Only customer side matches → Purchase
+    if best_cust >= 0.5 and best_vend < 0.5:
+        return "Purchase"
+
+    # Only vendor side matches → Sales
+    if best_vend >= 0.5 and best_cust < 0.5:
+        return "Sales"
+
+    # Both sides match → use stronger, break ties in favour of Sales
+    if best_cust >= 0.5 and best_vend >= 0.5:
+        if best_cust > best_vend + 0.1:
+            return "Purchase"
+        return "Sales"
+
+    # No strong match
+    return "Unclassified"
+
+def _classify_and_set_subcategory(register_entry: Dict[str, Any], our_companies_list: List[str]) -> Dict[str, Any]:
+    # 1. First classify the type (Initial Guess)
+    invoice_type = _classify_type(register_entry, our_companies_list)
+    register_entry["Type"] = invoice_type # Temporarily set it
     
-    try:
-        dt = entry.get("Date")
-        ccy = entry.get("Currency")
-        if not dt or not ccy:
-            raise ValueError("Missing date/currency")
+    # 2. Fallback inference if still Unclassified (original logic)
+    if invoice_type == "Unclassified":
+        vendor_address = register_entry.get("Vendor Address") or ""
+        customer_address = register_entry.get("Customer Address") or ""
+        vendor_country = _extract_country_from_address(vendor_address)
+        customer_country = _extract_country_from_address(customer_address)
+        
+        if vendor_country and customer_country:
+            is_vendor_nl = _is_nl_country(vendor_country)
+            is_customer_nl = _is_nl_country(customer_country)
             
-        rate, date_used = get_eur_rate(date.fromisoformat(dt), ccy)
-        
-        entry["FX Rate (ccy->EUR)"] = str(rate)
-        entry["FX Rate Date"] = date_used
-        entry["Nett Amount (EUR)"] = round(float(Decimal(str(entry["Nett Amount"])) * rate), 2)
-        entry["VAT Amount (EUR)"] = round(float(Decimal(str(entry["VAT Amount"])) * rate), 2)
-        entry["Gross Amount (EUR)"] = round(float(Decimal(str(entry["Gross Amount"])) * rate), 2)
-        
-    except Exception as e:
-        log.warning(f"FX conversion failed: {e}")
-        entry["FX Error"] = str(e)
+            if is_vendor_nl and not is_customer_nl:
+                invoice_type = "Sales"
+            elif is_customer_nl and not is_vendor_nl:
+                invoice_type = "Purchase"
+            elif is_vendor_nl and is_customer_nl:
+                invoice_type = "Purchase" # Default assumption
     
-    return entry
+    register_entry["Type"] = invoice_type
+    
+    # 3. Determine Subcategory
+    vendor_address = register_entry.get("Vendor Address")
+    customer_address = register_entry.get("Customer Address")
+    vat_percentage = register_entry.get("VAT %")
+    full_data = register_entry.get("Full_Extraction_Data", {})
+    invoice_text = full_data.get("_invoice_text", "") if isinstance(full_data, dict) else ""
+    
+    subcategory = _determine_invoice_subcategory(
+        invoice_type=invoice_type,
+        vendor_address=vendor_address,
+        customer_address=customer_address,
+        vat_percentage=vat_percentage,
+        invoice_text=invoice_text
+    )
+    register_entry["Subcategory"] = subcategory
+    
+    # 4. Determine Dutch VAT Return Category
+    vendor_country = register_entry.get("Vendor Country")
+    customer_country = register_entry.get("Customer Country")
+    if not vendor_country and vendor_address:
+        vendor_country = _extract_country_from_address(vendor_address)
+        if vendor_country:
+            register_entry["Vendor Country"] = vendor_country  # Save back to register_entry
+            log.debug(f"Extracted vendor country '{vendor_country}' from address: {vendor_address}")
+    if not customer_country and customer_address:
+        customer_country = _extract_country_from_address(customer_address)
+        if customer_country:
+            register_entry["Customer Country"] = customer_country  # Save back to register_entry
+            log.debug(f"Extracted customer country '{customer_country}' from address: {customer_address}")
+        else:
+            log.warning(f"Could not extract customer country from address: {customer_address}")
+    
+    vat_amount = register_entry.get("VAT Amount")
+    goods_services_indicator = register_entry.get("Goods Services Indicator")
+    reverse_charge_applied = register_entry.get("Reverse Charge Applied", False)
+    vat_category = register_entry.get("VAT Category")
+    customer_vat_id = register_entry.get("Customer VAT ID")
+    vendor_vat_id = register_entry.get("Vendor VAT ID")
+    
+    # Automatic reverse charge detection based on transaction characteristics
+    # Reverse charge applies when:
+    # - B2B cross-border services (supplier/customer from different countries)
+    # - 0% VAT charged (VAT shifts to customer)
+    # - Customer has VAT number (B2B transaction)
+    if not reverse_charge_applied:  # Only detect if not already set by keywords
+        is_services = (goods_services_indicator or "").lower() == "services"
+        vat_rate_is_zero = vat_percentage is not None and abs(float(vat_percentage)) < 0.01
+        vat_amount_is_zero = vat_amount is None or abs(float(vat_amount or 0.0)) < 0.01
+        has_customer_vat = bool(customer_vat_id and str(customer_vat_id).strip())
+        
+        if invoice_type == "Purchase":
+            # Purchase: Supplier from outside Netherlands, services, 0% VAT, B2B
+            is_supplier_nl = _is_nl_country(vendor_country) if vendor_country else False
+            if (not is_supplier_nl and vendor_country and 
+                is_services and 
+                (vat_rate_is_zero or vat_amount_is_zero) and
+                has_customer_vat):
+                reverse_charge_applied = True
+                if not register_entry.get("Reverse Charge Note"):
+                    register_entry["Reverse Charge Note"] = (
+                        f"Reverse charge applies: B2B cross-border service from {vendor_country}. "
+                        f"VAT must be self-accounted in Netherlands."
+                    )
+        
+        elif invoice_type == "Sales":
+            # Sales: Customer from outside Netherlands, services, 0% VAT, B2B
+            is_customer_nl = _is_nl_country(customer_country) if customer_country else False
+            if (not is_customer_nl and customer_country and
+                is_services and
+                (vat_rate_is_zero or vat_amount_is_zero) and
+                has_customer_vat):
+                reverse_charge_applied = True
+                if not register_entry.get("Reverse Charge Note"):
+                    register_entry["Reverse Charge Note"] = (
+                        f"Reverse charge applies: B2B cross-border service to {customer_country}. "
+                        f"Customer must self-account VAT in their country."
+                    )
+    
+    # Update register_entry with detected reverse charge
+    register_entry["Reverse Charge Applied"] = reverse_charge_applied
+    
+    # Defensive call – ensure we always get a (box, reason) tuple
+    try:
+        result = _determine_dutch_vat_return_category(
+        invoice_type=invoice_type,
+        vendor_country=vendor_country,
+        customer_country=customer_country,
+        vat_percentage=vat_percentage,
+        vat_amount=vat_amount,
+        goods_services_indicator=goods_services_indicator,
+        reverse_charge_applied=reverse_charge_applied,
+        customer_vat_id=customer_vat_id,
+        vendor_vat_id=vendor_vat_id,
+        vat_category=vat_category,
+    )
+        log.debug(f"VAT mapping result type: {type(result)}, value: {result}")
+        if isinstance(result, tuple) and len(result) == 2:
+            vat_box, vat_reason = result
+        else:
+            log.error(f"VAT mapping returned invalid result: type={type(result)}, value={result}")
+            vat_box, vat_reason = "UNDETERMINED", f"Internal error: VAT mapping returned invalid result (type={type(result).__name__}, value={result})"
+    except Exception as e:
+        log.error(f"Dutch VAT mapping failed: {e}")
+        vat_box, vat_reason = "UNDETERMINED", f"Internal error during VAT mapping: {e}"
+    register_entry["Dutch VAT Return Category"] = vat_box or ""
+    register_entry["Dutch VAT Return Category Description"] = DUTCH_VAT_CATEGORY_DESCRIPTIONS.get(
+        vat_box, ""
+    )
+    register_entry["Dutch VAT Return Category Reason"] = vat_reason
 
+    # Internal tax category flags for downstream posting / VAT calculation
+    if vat_box == "NO_TURNOVER_BOX":
+        # Non‑EU purchase of services – reverse charge import of services
+        register_entry["Internal Tax Category"] = "NON_EU_SERVICE_REVERSE_CHARGE"
+    elif vat_box == "OUTSIDE_SCOPE":
+        # Non‑EU purchase of goods – import via customs
+        register_entry["Internal Tax Category"] = "NON_EU_GOODS_IMPORT"
+
+    # 5. ICP
+    register_entry = _set_icp_fields_for_nl(register_entry)
+    
+    return register_entry
+
+def _convert_to_eur_fields(entry: dict, conversion_enabled: bool = True) -> dict:
+    if not conversion_enabled:
+        entry["FX Rate (ccy->EUR)"] = None
+        entry["Nett Amount (EUR)"] = None
+        entry["VAT Amount (EUR)"] = None
+        entry["Gross Amount (EUR)"] = None
+        entry["FX Conversion Note"] = "Currency conversion disabled"
+        return entry
+    try:
+        ccy = (entry.get("Currency") or "").upper().strip()
+        inv_date_str = entry.get("Date")
+
+        if not inv_date_str or not ccy:
+            entry["FX Rate (ccy->EUR)"] = None
+            entry["Nett Amount (EUR)"] = None
+            entry["VAT Amount (EUR)"] = None
+            entry["Gross Amount (EUR)"] = None
+            entry["FX Error"] = "Missing date or currency for conversion"
+            return entry
+
+        if ccy == "EUR":
+            entry["FX Rate (ccy->EUR)"] = "1.0000"
+            entry["FX Rate Date"] = inv_date_str
+            entry["Nett Amount (EUR)"] = round(float(entry.get("Nett Amount", 0) or 0), 2)
+            entry["VAT Amount (EUR)"] = round(float(entry.get("VAT Amount", 0) or 0), 2)
+            entry["Gross Amount (EUR)"] = round(float(entry.get("Gross Amount", 0) or 0), 2)
+            return entry
+
+        inv_dt = date.fromisoformat(inv_date_str)
+        rate, used_date = get_eur_rate(inv_dt, ccy)
+        entry["FX Rate (ccy->EUR)"] = str(rate)
+        entry["FX Rate Date"] = used_date
+
+        for k_src, k_dst in [
+            ("Nett Amount", "Nett Amount (EUR)"),
+            ("VAT Amount",  "VAT Amount (EUR)"),
+            ("Gross Amount","Gross Amount (EUR)")
+        ]:
+            amt = Decimal(str(entry.get(k_src, 0) or 0))
+            converted = q_money(amt * rate)
+            entry[k_dst] = round(float(converted), 2)
+
+        return entry
+    except Exception as ex:
+        log.error(f"EUR conversion failed for entry: {ex}")
+        entry["FX Rate (ccy->EUR)"] = None
+        entry["Nett Amount (EUR)"] = None
+        entry["VAT Amount (EUR)"] = None
+        entry["Gross Amount (EUR)"] = None
+        entry["FX Error"] = f"EUR conversion failed: {str(ex)}"
+        return entry
 # -------------------- Main pipeline --------------------
 def robust_invoice_processor(pdf_bytes: bytes, filename: str) -> dict:
-    # 1. Extract Text
-    text = get_text_from_document(pdf_bytes, filename)
-    
-    # 2. Structure with LLM
-    llm_data = structure_text_with_llm(text, filename)
-    llm_data["_invoice_text"] = text # Preserve for regex fallback
-    
-    # 3. Validation
-    validate_extraction(llm_data, filename)
-    
+    invoice_text = get_text_from_document(pdf_bytes, filename)
+    llm_data = structure_text_with_llm(invoice_text, filename)
+    # Validate extraction and capture errors for confidence scoring
+    _, _, _, _, _, validation_errors = validate_extraction(llm_data, filename)
+    llm_data["_invoice_text"] = invoice_text[:20000]
+    llm_data["_validation_errors"] = validation_errors  # Store for use in confidence scoring
     return llm_data
 
-# -------------------- Posting rules (stub) --------------------
-DEFAULT_COA = {}
-DEFAULT_RULES = []
-def build_journal_from_entry(entry, coa=None, rules=None):
-    return {} # Implementation optional for this specific request
+# -------------------- Posting rules (data-driven) --------------------
+DEFAULT_COA = {
+    "AR": "1100",
+    "AP": "2000",
+    "SALES": "4000",
+    "COGS": "5000",
+    "FREIGHT": "5100",
+    "SOFTWARE": "5200",
+    "VAT_PAYABLE": "2100",
+    "VAT_RECOVERABLE": "1400",
+    "CASH": "1000",
+}
+
+DEFAULT_RULES = [
+    {
+        "condition": {"Type": "Sales"},
+        "posting": {
+            "dr": [{"account": "AR", "amount": "Gross Amount (EUR)"}],
+            "cr": [
+                {"account": "SALES", "amount": "Nett Amount (EUR)"},
+                {"account": "VAT_PAYABLE", "amount": "VAT Amount (EUR)"},
+            ],
+        },
+    },
+    {
+        "condition": {"Type": "Purchase", "VAT Category": "Zero Rated"},
+        "posting": {
+            "dr": [{"account": "FREIGHT", "amount": "Nett Amount (EUR)"}],
+            "cr": [{"account": "AP", "amount": "Gross Amount (EUR)"}],
+        },
+    },
+    {
+        "condition": {"Type": "Unclassified", "Vendor Name_regex": ".*Google Cloud.*"},
+        "posting": {
+            "dr": [{"account": "SOFTWARE", "amount": "Gross Amount (EUR)"}],
+            "cr": [{"account": "AP", "amount": "Gross Amount (EUR)"}],
+        },
+    },
+]
+
+def _match_rule(entry: dict, rules: list) -> Optional[dict]:
+    import re as _re
+    for r in rules:
+        cond = r.get("condition", {})
+        ok = True
+        for k, v in cond.items():
+            if k.endswith("_regex"):
+                field = k[:-6]
+                if not _re.match(str(v), str(entry.get(field, "") or ""), flags=_re.I):
+                    ok = False; break
+            else:
+                if str(entry.get(k, "")).strip() != str(v).strip():
+                    ok = False; break
+        if ok:
+            return r
+    return None
+
+def _amount_field_to_value(entry: dict, field: str) -> float:
+    if "(EUR)" in field:
+        return float(entry.get(field) or 0.0)
+    mapping = {
+        "Nett Amount": "Nett Amount (EUR)",
+        "VAT Amount": "VAT Amount (EUR)",
+        "Gross Amount": "Gross Amount (EUR)",
+    }
+    f = mapping.get(field, field)
+    return float(entry.get(f) if entry.get(f) is not None else entry.get(field, 0.0) or 0.0)
+
+def build_journal_from_entry(entry: dict, coa: dict = None, rules: list = None) -> dict:
+    coa = {**DEFAULT_COA, **(coa or {})}
+    rules = rules or DEFAULT_RULES
+
+    if entry.get("FX Error"):
+        return {"status": "blocked", "reason": "Needs FX", "entry": entry}
+    if not entry.get("Date"):
+        return {"status": "blocked", "reason": "Missing Date", "entry": entry}
+
+    rule = _match_rule(entry, rules)
+    if not rule:
+        return {"status": "blocked", "reason": "Unmapped", "entry": entry}
+
+    lines = []
+    for side in ("dr", "cr"):
+        for post in rule["posting"].get(side, []):
+            acct_key = post["account"]
+            acct = coa.get(acct_key, acct_key)
+            amt = _amount_field_to_value(entry, post["amount"])
+            lines.append({
+                "account_code": acct,
+                "debit": round(amt, 2) if side == "dr" else 0.0,
+                "credit": round(amt, 2) if side == "cr" else 0.0,
+            })
+
+    d = round(sum(x["debit"] for x in lines), 2)
+    c = round(sum(x["credit"] for x in lines), 2)
+    if d != c:
+        return {"status": "blocked", "reason": f"Imbalance {d} != {c}", "entry": entry, "lines": lines}
+
+    return {
+        "status": "posted",
+        "journal": {
+            "entry_date": entry["Date"],
+            "memo": entry.get("Description") or f"{entry.get('Vendor Name')} / {entry.get('Invoice Number')}",
+            "currency": entry.get("Currency"),
+            "fx_rate": entry.get("FX Rate (ccy->EUR)"),
+            "client_id": entry.get("client_id"),
+            "lines": lines,
+        }
+    }
+
+__all__ = [
+    "robust_invoice_processor",
+    "build_journal_from_entry",
+    "DEFAULT_COA",
+    "DEFAULT_RULES",
+]

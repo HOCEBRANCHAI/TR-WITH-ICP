@@ -1196,17 +1196,30 @@ def _determine_dutch_vat_return_category(
                         "Import of goods handled via customs (import VAT), not via Dutch VAT turnover boxes."
                     )
 
-            # 4b – Services from outside Netherlands (EU or non-EU) - reverse charge
+            # 4a – Non-EU service imports (Dynamic check, not hardcoded)
+            # This must be checked BEFORE the general 4b logic to ensure Non-EU services
+            # are correctly categorized as "Import of Services from Non-EU Country" in Box 4a
+            # Uses _is_eu_country() helper to ensure future compliance if EU membership changes
+            if not is_suppl_nl and indicator == "services":
+                # Dynamic check: Is supplier country NOT an EU member?
+                is_suppl_non_eu = not _is_eu_country(supplier_country)
+                
+                if is_suppl_non_eu:
+                    # Non-EU service import - reverse charge applies (Article 196)
+                    # Map to Box 4a as per requirement
+                    return (
+                        "4a",
+                        f"Import of Services from Non-EU Country ({supplier_country}) - reverse charge (Article 196) - Box 4a"
+                    )
+
+            # 4b – Services from EU suppliers (non-NL) - reverse charge
             # According to Dutch VAT rules: "Diensten uit het buitenland aan u verricht"
-            # This includes both EU and non-EU services when reverse charge applies
+            # This applies ONLY to EU (non-NL) services when reverse charge applies
             if not is_suppl_nl and indicator == "services":
                 rate_is_0 = _approx_rate(vat_percentage, 0.0)
                 if rate_is_0 or vat_amt_val == 0.0:
                     if is_suppl_eu:
                         return "4b", "Purchase of services from EU supplier (non‑NL) - reverse charge"
-                    else:
-                        # Non-EU services also go to 4b when reverse charge applies
-                        return "4b", "Purchase of services from non-EU supplier - reverse charge (Article 196)"
 
             # Everything else cannot be safely and legally inferred
             return "UNDETERMINED", "Purchase invoice could not be classified with available data"
@@ -1233,7 +1246,7 @@ def _is_eu_country(country: Optional[str]) -> bool:
 
 def _is_nl_country(country: Optional[str]) -> bool:
     """
-    Returns True if the country represents the Netherlands (NL),
+   Returns True if the country represents the Netherlands (NL),
     with robust normalisation to tolerate extra spaces or variants.
     """
     if not country:
@@ -1765,9 +1778,28 @@ def _classify_and_set_subcategory(register_entry: Dict[str, Any], our_companies_
         log.error(f"Dutch VAT mapping failed: {e}")
         vat_box, vat_reason = "UNDETERMINED", f"Internal error during VAT mapping: {e}"
     register_entry["Dutch VAT Return Category"] = vat_box or ""
-    register_entry["Dutch VAT Return Category Description"] = DUTCH_VAT_CATEGORY_DESCRIPTIONS.get(
-        vat_box, ""
-    )
+    
+    # Set description dynamically for Box 4a based on invoice type
+    if vat_box == "4a":
+        # Box 4a can be either EU goods or non-EU services - determine which one
+        goods_services = (register_entry.get("Goods Services Indicator") or "").lower()
+        vendor_country = register_entry.get("Vendor Country")
+        is_vendor_eu = _is_eu_country(vendor_country) if vendor_country else False
+        
+        if goods_services == "services" and not is_vendor_eu:
+            # Non-EU purchase of services – reverse charge import of services (Box 4a)
+            register_entry["Dutch VAT Return Category Description"] = "Import of Services from Non-EU Country"
+            register_entry["Internal Tax Category"] = "IMPORT_SERVICE_NON_EU"
+        else:
+            # EU acquisition of goods (Box 4a)
+            register_entry["Dutch VAT Return Category Description"] = "Intra-EU acquisition of goods"
+            register_entry["Internal Tax Category"] = "EU_ACQUISITION_GOODS"
+    else:
+        # For all other categories, use the standard description
+        register_entry["Dutch VAT Return Category Description"] = DUTCH_VAT_CATEGORY_DESCRIPTIONS.get(
+            vat_box, ""
+        )
+    
     register_entry["Dutch VAT Return Category Reason"] = vat_reason
 
     # Internal tax category flags for downstream posting / VAT calculation

@@ -1,0 +1,27 @@
+# Core API framework
+fastapi
+uvicorn
+
+# PDF parsing and OCR
+PyPDF2>=3.0
+pdf2image
+Pillow
+# Use headless OpenCV on servers (no GUI/libGL dependencies)
+opencv-python-headless
+numpy
+pytesseract
+
+# File uploads via FastAPI
+python-multipart
+
+# OpenAI for accurate financial data extraction
+openai>=1.0
+
+# AWS SDK for Textract
+boto3>=1.20
+
+# Environment variable management
+python-dotenv
+
+# HTTP requests for FX conversion
+requests

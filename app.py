@@ -236,7 +236,7 @@ async def upload_and_extract(
         llm_data = robust_invoice_processor(file_bytes, file.filename)
 
         # Step 2: Map to register entry format
-        register_entry = _map_llm_output_to_register_entry(llm_data)
+        register_entry = _map_llm_output_to_register_entry(llm_data, file.filename)
 
         # Step 3: Classify type and set subcategory
         register_entry = _classify_and_set_subcategory(register_entry, our_companies_list)
@@ -331,7 +331,7 @@ async def upload_multiple_and_extract(
                 llm_data = robust_invoice_processor(file_bytes, file.filename)
 
                 # Step 2: Map to register entry format
-                register_entry = _map_llm_output_to_register_entry(llm_data)
+                register_entry = _map_llm_output_to_register_entry(llm_data, file.filename)
 
                 # Step 3: Classify type and set subcategory
                 register_entry = _classify_and_set_subcategory(register_entry, our_companies_list)

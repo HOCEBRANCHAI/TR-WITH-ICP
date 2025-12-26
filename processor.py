@@ -18,6 +18,7 @@ from PIL import Image
 import cv2
 import numpy as np
 import pytesseract
+import difflib  # Used for fuzzy string matching
 
 # LLM + HTTP
 from openai import OpenAI
@@ -471,13 +472,13 @@ RULES:
    - The country is ESSENTIAL for determining EU vs non-EU transactions.
    - Look for country names (e.g., "Netherlands", "Germany", "France") or country codes (e.g., "NL", "DE", "FR") at the end of addresses.
    - If country is not explicitly stated, INFER it from well-known city names:
-     * Cities like "Galway", "Dublin", "Cork" → Ireland
-     * Cities like "London", "Manchester", "Birmingham" → United Kingdom
-     * Cities like "Amsterdam", "Rotterdam", "The Hague" → Netherlands
-     * Cities like "Paris", "Lyon", "Marseille" → France
-     * Cities like "Berlin", "Munich", "Hamburg" → Germany
-     * Cities like "Madrid", "Barcelona", "Valencia" → Spain
-     * Cities like "Rome", "Milan", "Naples" → Italy
+     * Cities like "Galway", "Dublin", "Cork" -> Ireland
+     * Cities like "London", "Manchester", "Birmingham" -> United Kingdom
+     * Cities like "Amsterdam", "Rotterdam", "The Hague" -> Netherlands
+     * Cities like "Paris", "Lyon", "Marseille" -> France
+     * Cities like "Berlin", "Munich", "Hamburg" -> Germany
+     * Cities like "Madrid", "Barcelona", "Valencia" -> Spain
+     * Cities like "Rome", "Milan", "Naples" -> Italy
      * And other major EU/non-EU cities you recognize
    - Always include the inferred country in the address string (e.g., "Annaghdown, Galway, Ireland").
    - Include the full address as a single string with all address components.
@@ -540,29 +541,21 @@ SCHEMA:
 def structure_text_with_llm(invoice_text: str, filename: str) -> dict:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise ValueError("OPENAI_API_KEY not found in environment.")
-
+        raise ValueError("OPENAI_API_KEY not found")
     client = OpenAI(api_key=api_key)
-    reduced = reduce_invoice_text(invoice_text)
     try:
-        log.info(f"LLM extracting {filename}...")
         r = client.chat.completions.create(
             model="gpt-4o",
             response_format={"type": "json_object"},
             temperature=0.0,
             messages=[
                 {"role": "system", "content": LLM_PROMPT},
-                {"role": "user", "content": f"**INVOICE TEXT TO PARSE (reduced):**\n{reduced}"}
+                {"role": "user", "content": f"INVOICE TEXT:\n{invoice_text[:12000]}"}
             ]
         )
         return json.loads(r.choices[0].message.content)
-    except json.JSONDecodeError as e:
-        log.error(f"LLM JSON error {filename}: {e}")
-        # Return empty structure to not crash
-        return {}
     except Exception as e:
-        log.error(f"LLM API error {filename}: {e}")
-        # Return empty structure to not crash
+        log.error(f"LLM error {filename}: {e}")
         return {}
 
 def _translate_to_english_if_dutch(text: str) -> str:
@@ -578,7 +571,7 @@ def _translate_to_english_if_dutch(text: str) -> str:
 
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        # No API key → cannot translate; keep original description.
+        # No API key -> cannot translate; keep original description.
         return text
 
     client = OpenAI(api_key=api_key)
@@ -878,37 +871,37 @@ def _normalize_company_name(name: str) -> str:
 
 def _calculate_name_similarity(name1: str, name2: str) -> float:
     """
-    Calculates similarity between two normalized company names.
+    Calculates similarity between two normalized company names using difflib.
     Returns a score between 0.0 and 1.0.
     """
-    if not name1 or not name2:
-        return 0.0
-    
     n1 = _normalize_company_name(name1)
     n2 = _normalize_company_name(name2)
-    
-    if n1 == n2:
-        return 1.0
-    
-    # Check if one is substring of another
+    if not n1 or not n2:
+        return 0.0
     if n1 in n2 or n2 in n1:
-        shorter = min(len(n1), len(n2))
-        longer = max(len(n1), len(n2))
-        return shorter / longer if longer > 0 else 0.0
-    
-    # Word-based similarity
-    words1 = set(n1.split())
-    words2 = set(n2.split())
-    
-    if not words1 or not words2:
+        return 1.0
+    return difflib.SequenceMatcher(None, n1, n2).ratio()
+
+def _calculate_name_similarity_robust(name1: str, name2: str) -> float:
+    """
+    Token Set Ratio approach: highly robust against suffixes like 'B.V.'
+    """
+    n1 = _normalize_company_name(name1)
+    n2 = _normalize_company_name(name2)
+    if not n1 or not n2:
         return 0.0
     
-    # Calculate Jaccard similarity
-    intersection = words1.intersection(words2)
-    union = words1.union(words2)
+    s1 = set(n1.split())
+    s2 = set(n2.split())
     
-    if not union:
+    # Intersection score (how many words match?)
+    intersection = s1.intersection(s2)
+    if not intersection:
         return 0.0
+    
+    # Score based on the SHORTER string (so "Google" matches "Google Ireland Ltd")
+    score = len(intersection) / min(len(s1), len(s2))
+    return score
     
     return len(intersection) / len(union)
 
@@ -922,13 +915,12 @@ def _split_company_list(raw: str) -> List[str]:
 def _extract_ibans_via_regex(text: str) -> List[str]:
     """
     Finds IBANs in raw text even if LLM misses them.
-    Looks for 2 letters + 2 digits + 10-30 alphanumeric.
+    Looks for 2 letters, 2 digits, 10-30 alphanumeric.
     """
     if not text: return []
-    # Clean whitespace for better matching (IBANs often have spaces)
     clean = re.sub(r'\s+', '', text)
-    # Generic IBAN pattern
-    matches = re.findall(r'([A-Z]{2}\d{2}[A-Z0-9]{10,30})', clean)
+    # Generic IBAN: 2 letters, 2 digits, 10-30 alphanumeric
+    return list(set(re.findall(r'([A-Z]{2}\d{2}[A-Z0-9]{10,30})', clean)))
     # Filter by length (valid IBANs are usually 15-34 chars)
     return list(set([m for m in matches if 15 <= len(m) <= 34]))
 
@@ -944,9 +936,6 @@ def _is_same_country_code(code: str, country_name: str) -> bool:
         return True
     return False
 
-# ----------------------------------------------------------------------------
-# DYNAMIC HELPER 2: SANITY CHECK & SWAP (Fixes "Galina" logic error)
-# ----------------------------------------------------------------------------
 # ----------------------------------------------------------------------------
 # EU Country Detection & Address Parsing (Keep Original Robust Logic)
 # ----------------------------------------------------------------------------
@@ -1254,7 +1243,7 @@ def _is_eu_country(country: Optional[str]) -> bool:
 def _is_nl_country(country: Optional[str]) -> bool:
     """
    Returns True if the country represents the Netherlands (NL),
-    with robust normalisation to tolerate extra spaces or variants.
+   with robust normalisation to tolerate extra spaces or variants.
     """
     if not country:
         return False
@@ -1486,7 +1475,7 @@ def _is_credit_note_simple(llm_data: Dict[str, Any], invoice_text: str) -> bool:
     ]
     return any(kw in text for kw in keywords)
 
-def _map_llm_output_to_register_entry(llm_data: Dict[str, Any]) -> Dict[str, Any]:
+def _map_llm_output_to_register_entry(llm_data: Dict[str, Any], filename: Optional[str] = None) -> Dict[str, Any]:
     description = ""
     if llm_data.get("line_items"):
         raw_desc = llm_data["line_items"][0].get("description", "") or ""
@@ -1587,150 +1576,285 @@ def _map_llm_output_to_register_entry(llm_data: Dict[str, Any]) -> Dict[str, Any
         "Due Date": llm_data.get("due_date"),
         "Payment Terms": llm_data.get("payment_terms"),
         "Notes": llm_data.get("notes"),
+        "_filename": filename,  # Store filename for classification checks
         "Full_Extraction_Data": llm_data
     }
 
 def _sanity_fix_vendor_customer(register_entry: Dict[str, Any], our_companies_list: List[str]) -> None:
     """
-    Fixes common logistics / freight invoice role inversions where
-    our company is incorrectly extracted as Vendor instead of Customer.
-    
-    This is a production-grade sanity check that runs BEFORE classification
-    to fix LLM extraction errors where our company appears as vendor when
-    it should be customer (common in logistics/freight invoices).
+    Sanity check function. 
+    Previously used to swap fields, but now disabled to avoid aggressive flipping.
     """
-    vendor = register_entry.get("Vendor Name") or ""
-    customer = register_entry.get("Customer Name") or ""
+    pass 
 
-    if not vendor or not customer:
-        return
+def _check_foreign_iban(register_entry: Dict[str, Any], our_companies_list: List[str]) -> bool:
+    """
+    Returns True if a Non-NL IBAN is found in the raw text.
+    This is the 'Nuclear Option' for catching Import invoices misclassified as Sales.
+    """
+    # Only apply if we are actually a Dutch company
+    our_norms = [_normalize_company_name(x) for x in our_companies_list if x]
+    is_we_dutch = any("dutch" in x or "nl" in x for x in our_norms)
+    if not is_we_dutch:
+        return False
 
-    our_norms = [_normalize_company_name(c) for c in our_companies_list if c]
-    if not our_norms:
-        return
+    raw_text = register_entry.get("Full_Extraction_Data", {}).get("_invoice_text", "")
+    found_ibans = _extract_ibans_via_regex(raw_text)
+    
+    for iban in found_ibans:
+        clean = re.sub(r'[^A-Z0-9]', '', iban.upper())
+        if len(clean) < 15:
+            continue
+        country = clean[:2]
+        # Ignore NL IBANs. Ignore potential false positives (too short).
+        if country != 'NL' and country.isalpha():
+            log.info(f"Foreign IBAN detected: {clean} ({country})")
+            return True
+    return False
 
-    v_norm = _normalize_company_name(vendor)
-    c_norm = _normalize_company_name(customer)
+def _check_filename_context(register_entry: Dict[str, Any], our_companies_list: List[str]) -> Optional[str]:
+    """
+    Checks filename for patterns indicating we are the issuer (Sales invoice).
+    Examples: "Invoice DFS- 002-2025" or "Invoice Dutch Food Solutions"
+    Returns 'Sales' if filename suggests we issued the invoice, None otherwise.
+    
+    IMPORTANT: Only returns Sales if we can find our company name/initials in the filename.
+    Just having "Sales" in the filename is NOT enough - that could be someone else's sales invoice to us.
+    """
+    filename = register_entry.get("_filename", "") or register_entry.get("Full_Extraction_Data", {}).get("_filename", "")
+    if not filename:
+        return None
+    
+    filename_lower = filename.lower()
+    
+    # Check if filename starts with "invoice" followed by our company name/initials
+    for company in our_companies_list:
+        comp_norm = _normalize_company_name(company)
+        comp_words = comp_norm.split()
+        
+        # Extract initials (first letters of each word)
+        initials = "".join([w[0] for w in comp_words if w])
+        
+        # Pattern 1: "Invoice [Company Name]" or "Invoice [Company Initials]"
+        # Example: "Invoice DFS- 002-2025" or "Invoice Dutch Food Solutions"
+        if filename_lower.startswith("invoice") or "factuur" in filename_lower:
+            # Check if company name or initials appear early in filename
+            filename_early = filename_lower[:100]  # First 100 chars
+            if comp_norm in filename_early or (initials and initials.lower() in filename_early):
+                log.info(f"Filename indicates Sales: '{filename}' contains our company -> Sales")
+                return "Sales"
+            
+            # Also check for common patterns like "Invoice DFS-" or "Invoice DFS "
+            if initials and len(initials) >= 2:
+                initials_pattern = f"invoice {initials.lower()}"
+                if initials_pattern in filename_early:
+                    log.info(f"Filename indicates Sales: '{filename}' contains our initials '{initials}' -> Sales")
+                    return "Sales"
+                # Also check for "Factuur" (Dutch for Invoice)
+                factuur_pattern = f"factuur {initials.lower()}"
+                if factuur_pattern in filename_early:
+                    log.info(f"Filename indicates Sales: '{filename}' contains our initials '{initials}' after 'factuur' -> Sales")
+                    return "Sales"
+    
+    # If filename contains "sales" but NOT our company, this is suspicious - could be someone else's sales invoice
+    # Don't trust it as a Sales indicator
+    if "sales" in filename_lower:
+        found_our_company = False
+        for company in our_companies_list:
+            comp_norm = _normalize_company_name(company)
+            if comp_norm in filename_lower:
+                found_our_company = True
+                break
+        if not found_our_company:
+            log.info(f"Filename contains 'sales' but not our company - ignoring as false positive: '{filename}'")
+    
+    return None
 
-    # Case: our company is vendor AND customer is foreign → very likely swapped
-    if any(our in v_norm for our in our_norms) and not any(our in c_norm for our in our_norms):
-        log.warning(
-            f"[SANITY SWAP] Detected likely logistics invoice role inversion. "
-            f"Swapping Vendor <-> Customer. Vendor={vendor}, Customer={customer}"
-        )
+def _check_keyword_context(register_entry: Dict[str, Any], our_companies_list: List[str]) -> Optional[str]:
+    """
+    Scans the raw text for 'Deep Context' around EVERY mention of our company.
+    Finds 'Ship-to', 'Debtor', 'Client' = Purchase.
+    Finds 'Seller', 'Supplier' = Sales.
+    Uses signal counting to handle multi-page invoices with conflicting signals.
+    """
+    raw_text = register_entry.get("Full_Extraction_Data", {}).get("_invoice_text", "")
+    if not raw_text:
+        return None
+    
+    raw_lower = raw_text.lower()
+    
+    # Track scores (multi-page invoices might have conflicting signals)
+    sales_signals = 0
+    purchase_signals = 0
 
-        # Swap names
-        register_entry["Vendor Name"], register_entry["Customer Name"] = (
-            register_entry["Customer Name"],
-            register_entry["Vendor Name"],
-        )
+    for company in our_companies_list:
+        comp_norm = _normalize_company_name(company)
+        start_pos = 0
+        while True:
+            idx = raw_lower.find(comp_norm, start_pos)
+            if idx == -1:
+                break
+            
+            # Look at the window BEFORE the company name (150 chars)
+            window_before = raw_lower[max(0, idx-150):idx]
+            # Also look at the window AFTER the company name (100 chars)
+            window_after = raw_lower[idx:min(len(raw_lower), idx+len(comp_norm)+100)]
+            
+            # Purchase Keywords (We are receiving goods/services)
+            purchase_keywords = ["buyer", "customer", "bill to", "ship to", "ship-to", "consignee", "debtor", "client", "invoice to", "afnemer", "klant"]
+            if any(x in window_before for x in purchase_keywords) or any(x in window_after for x in purchase_keywords):
+                purchase_signals += 1
+            
+            # Sales Keywords (We are providing goods/services)
+            sales_keywords = ["seller", "supplier", "vendor", "provider", "issuer", "leverancier", "verkoper"]
+            if any(x in window_before for x in sales_keywords) or any(x in window_after for x in sales_keywords):
+                sales_signals += 1
+            
+            start_pos = idx + 1
 
-        # Swap VAT IDs
-        register_entry["Vendor VAT ID"], register_entry["Customer VAT ID"] = (
-            register_entry["Customer VAT ID"],
-            register_entry["Vendor VAT ID"],
-        )
-
-        # Swap addresses
-        register_entry["Vendor Address"], register_entry["Customer Address"] = (
-            register_entry["Customer Address"],
-            register_entry["Vendor Address"],
-        )
-
-        # Swap countries
-        register_entry["Vendor Country"], register_entry["Customer Country"] = (
-            register_entry["Customer Country"],
-            register_entry["Vendor Country"],
-        )
+    if purchase_signals > sales_signals:
+        log.info(f"Deep Context: Found {purchase_signals} Purchase signals vs {sales_signals} Sales signals -> Purchase")
+        return "Purchase"
+    if sales_signals > purchase_signals:
+        log.info(f"Deep Context: Found {sales_signals} Sales signals vs {purchase_signals} Purchase signals -> Sales")
+        return "Sales"
+        
+    return None
 
 def _classify_type(register_entry: Dict[str, Any], our_companies_list: List[str]) -> str:
     """
-    Decide if an invoice is **Purchase** or **Sales** based on where our company appears.
-
-    Correct accounting rule:
-    - If our company appears as the Customer, the invoice must be classified as Purchase.
-    - Sales should only be returned when our company appears only as Vendor and not as Customer.
-    
-    This ensures freight, customs, and multi-party invoices (where our name may appear in both
-    vendor and customer fields due to logistics or "for account of" scenarios) are classified correctly.
-
-    Priority:
-    1. If customer match ≥ threshold → Purchase (we're buying, being invoiced)
-    2. Else if vendor match ≥ threshold → Sales (we're selling, issuing invoice)
-    3. Else → Unclassified (country logic may fix later)
-      """
+    Decides Sales vs Purchase.
+    """
     vendor_name = register_entry.get("Vendor Name") or ""
     customer_name = register_entry.get("Customer Name") or ""
-
-    if not vendor_name and not customer_name:
-        log.warning("Both vendor and customer names are empty - cannot classify")
-        return "Unclassified"
-
-    v_norm = _normalize_company_name(vendor_name)
-    c_norm = _normalize_company_name(customer_name)
+    
     our_norms = [_normalize_company_name(x) for x in our_companies_list if x]
 
-    if not our_norms:
-        return "Unclassified"
+    # Helper: Check if name matches 'us' using Token Set Ratio
+    def is_us(target_raw):
+        best = 0.0
+        for our_raw in our_companies_list:
+            score = _calculate_name_similarity_robust(our_raw, target_raw)
+            best = max(best, score)
+        return best > 0.8  # High threshold
 
-    vendor_scores: List[float] = []
-    customer_scores: List[float] = []
+    us_is_vendor = is_us(vendor_name)
+    us_is_customer = is_us(customer_name)
 
-    for our_company in our_norms:
-        if not our_company:
-            continue
+    # 1. DEEP CONTEXT OVERRIDE (Fixes swapped fields - most reliable signal)
+    # This scans the actual invoice text for keywords around our company name
+    context_type = _check_keyword_context(register_entry, our_companies_list)
+    if context_type:
+        # If context says Sales, but we are Customer -> We will Swap later.
+        # Just return the correct Type here.
+        return context_type
+
+    # 2. POSITION LOGIC
+    if us_is_vendor and not us_is_customer:
+        # Special case: If customer is an individual (not a company), be more cautious
+        # Individual names typically don't have company suffixes like "B.V.", "Ltd", etc.
+        customer_name_lower = (customer_name or "").lower()
+        is_individual = not any(suffix in customer_name_lower for suffix in ["b.v.", "bv", "ltd", "limited", "inc", "llc", "gmbh", "sa", "sarl", "nv", "spa", "corp", "corporation"])
         
-        # Exact / substring match on normalized names
-        if our_company in c_norm:
-            customer_scores.append(len(our_company) / max(1, len(c_norm)))
-        if our_company in v_norm:
-            vendor_scores.append(len(our_company) / max(1, len(v_norm)))
-
-        # Fuzzy similarity on raw names
-        cust_sim = _calculate_name_similarity(our_company, customer_name)
-        vend_sim = _calculate_name_similarity(our_company, vendor_name)
-        if cust_sim >= 0.6:
-            customer_scores.append(cust_sim)
-        if vend_sim >= 0.6:
-            vendor_scores.append(vend_sim)
-
-    best_cust = max(customer_scores) if customer_scores else 0.0
-    best_vend = max(vendor_scores) if vendor_scores else 0.0
-
-    # PRIORITY 1: If customer match ≥ threshold → Purchase
-    # This is the correct accounting rule: if we appear as customer, we're buying
-    # This handles logistics invoices and "for account of" scenarios correctly
-    if best_cust >= 0.5:
-        return "Purchase"
-
-    # PRIORITY 2: Else if vendor match ≥ threshold → Sales
-    # Only classify as Sales if we appear as vendor AND NOT as customer
-    if best_vend >= 0.5:
+        if is_individual and customer_name:
+            # When customer is an individual and we're vendor, re-check keyword context
+            # This handles cases where LLM swapped fields and extracted individual as customer
+            recheck_context = _check_keyword_context(register_entry, our_companies_list)
+            if recheck_context == "Purchase":
+                log.info(f"Position says Sales (we are vendor to individual '{customer_name}'), but context says Purchase -> Purchase (likely field swap)")
+                return "Purchase"
+        
+        if _check_foreign_iban(register_entry, our_companies_list):
+            return "Purchase"
         return "Sales"
 
-    # PRIORITY 3: No strong match → Unclassified
+    if us_is_customer and not us_is_vendor:
+        return "Purchase"
+
+    if us_is_vendor and us_is_customer:
+        return "Purchase"
+
+    # 4. FALLBACK LOGIC
+    vendor_address = register_entry.get("Vendor Address") or ""
+    customer_address = register_entry.get("Customer Address") or ""
+    v_country = _extract_country_from_address(vendor_address)
+    c_country = _extract_country_from_address(customer_address)
+
+    if v_country and c_country:
+        is_v_nl = _is_nl_country(v_country)
+        is_c_nl = _is_nl_country(c_country)
+        
+        if is_v_nl and not is_c_nl:
+            return "Sales"
+        if is_c_nl and not is_v_nl:
+            return "Purchase"
+        if is_v_nl and is_c_nl:
+            return "Purchase"
+
     return "Unclassified"
 
-def _classify_and_set_subcategory(register_entry: Dict[str, Any], our_companies_list: List[str]) -> Dict[str, Any]:
-    # 🔥 SANITY FIX BEFORE CLASSIFICATION
-    # Fix common LLM extraction errors where our company is incorrectly placed as vendor
-    # when it should be customer (common in logistics/freight invoices)
-    _sanity_fix_vendor_customer(register_entry, our_companies_list)
+def _enforce_role_consistency(register_entry: Dict[str, Any], our_companies_list: List[str]):
+    """
+    If Type=Sales, We MUST be Vendor.
+    If Type=Purchase, We MUST be Customer.
+    Swap fields if this is violated.
+    """
+    invoice_type = register_entry.get("Type")
+    if invoice_type not in ("Sales", "Purchase"):
+        return
+
+    vendor_name = register_entry.get("Vendor Name") or ""
+    customer_name = register_entry.get("Customer Name") or ""
     
-    # 1. Now classify type (this will now work correctly after sanity fix)
+    def is_us(target_raw):
+        best = 0.0
+        for our_raw in our_companies_list:
+            score = _calculate_name_similarity_robust(our_raw, target_raw)
+            best = max(best, score)
+        return best > 0.8
+
+    us_is_vendor = is_us(vendor_name)
+    us_is_customer = is_us(customer_name)
+
+    # If Sales, we must be Vendor. If we are Customer instead, SWAP.
+    if invoice_type == "Sales" and us_is_customer and not us_is_vendor:
+        log.warning("Role Fix: Type is Sales but we are Customer. Swapping.")
+        _swap_vendor_customer(register_entry)
+
+    # If Purchase, we must be Customer. If we are Vendor instead, SWAP.
+    if invoice_type == "Purchase" and us_is_vendor and not us_is_customer:
+        log.warning("Role Fix: Type is Purchase but we are Vendor. Swapping.")
+        _swap_vendor_customer(register_entry)
+
+def _swap_vendor_customer(entry: Dict[str, Any]):
+    """Swap all vendor and customer fields."""
+    entry["Vendor Name"], entry["Customer Name"] = entry["Customer Name"], entry["Vendor Name"]
+    entry["Vendor VAT ID"], entry["Customer VAT ID"] = entry["Customer VAT ID"], entry["Vendor VAT ID"]
+    entry["Vendor Address"], entry["Customer Address"] = entry["Customer Address"], entry["Vendor Address"]
+    entry["Vendor IBAN"], entry["Customer IBAN"] = entry["Customer IBAN"], entry["Vendor IBAN"]
+    entry["Vendor Country"], entry["Customer Country"] = entry["Customer Country"], entry["Vendor Country"]
+
+def _classify_and_set_subcategory(register_entry: Dict[str, Any], our_companies_list: List[str]) -> Dict[str, Any]:
+    # 1. Classify
     invoice_type = _classify_type(register_entry, our_companies_list)
+    register_entry["Type"] = invoice_type
+    
+    # 2. Enforce Consistency (Swap if needed)
+    _enforce_role_consistency(register_entry, our_companies_list)
+    
+    # Update type variable after potential swaps/logic
+    invoice_type = register_entry["Type"]
     
     # NORMALIZE once – enforce canonical values (Sales / Purchase / Unclassified)
     if invoice_type:
         invoice_type = invoice_type.capitalize()  # Sales / Purchase / Unclassified
-    
-    register_entry["Type"] = invoice_type
+        register_entry["Type"] = invoice_type
     
     # Defensive assertion to catch future regressions
     assert register_entry["Type"] in ("Sales", "Purchase", "Unclassified"), \
         f"Invalid invoice type: {register_entry['Type']}"
     
-    # 2. Fallback inference – ONLY if still Unclassified
+    # 3. Fallback inference – ONLY if still Unclassified
     # Do NOT override if already classified as Sales or Purchase
     if register_entry["Type"] == "Unclassified":
         vendor_address = register_entry.get("Vendor Address") or ""

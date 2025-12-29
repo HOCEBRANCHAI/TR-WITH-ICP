@@ -1670,6 +1670,50 @@ def _check_filename_context(register_entry: Dict[str, Any], our_companies_list: 
     
     return None
 
+def _check_document_issuer_signal(register_entry: Dict[str, Any], our_companies_list: List[str]) -> Optional[str]:
+    """
+    Checks if document number or filename contains our company name/initials.
+    This is a STRONG signal that we issued the document (Sales).
+    Examples:
+    - Document Number: "DFS 25002104770" -> We issued it (Sales)
+    - Filename: "Debit Note - DFS 25002104770" -> We issued it (Sales)
+    Returns 'Sales' if strong signal found, None otherwise.
+    """
+    # Check document number first (strongest signal)
+    doc_number = register_entry.get("Document Number") or ""
+    if doc_number:
+        doc_lower = doc_number.lower()
+        for company in our_companies_list:
+            comp_norm = _normalize_company_name(company).lower()
+            comp_words = comp_norm.split()
+            initials = "".join([w[0] for w in comp_words if w]).lower()
+            
+            # Check if company name or initials appear in document number
+            if comp_norm in doc_lower or (initials and len(initials) >= 2 and initials in doc_lower):
+                log.info(f"Document Number '{doc_number}' contains our company/initials -> Strong Sales signal")
+                return "Sales"
+    
+    # Check filename as secondary signal
+    filename = register_entry.get("_filename", "") or register_entry.get("Full_Extraction_Data", {}).get("_filename", "")
+    if filename:
+        filename_lower = filename.lower()
+        for company in our_companies_list:
+            comp_norm = _normalize_company_name(company).lower()
+            comp_words = comp_norm.split()
+            initials = "".join([w[0] for w in comp_words if w]).lower()
+            
+            # Check for patterns like "Debit Note - DFS" or "Invoice DFS-"
+            # Look in first 150 chars of filename
+            filename_early = filename_lower[:150]
+            if comp_norm in filename_early or (initials and len(initials) >= 2 and initials in filename_early):
+                # Additional check: filename should contain invoice-like keywords
+                invoice_keywords = ["invoice", "factuur", "debit", "credit", "note", "nota"]
+                if any(kw in filename_early for kw in invoice_keywords):
+                    log.info(f"Filename '{filename}' contains our company/initials with invoice keywords -> Strong Sales signal")
+                    return "Sales"
+    
+    return None
+
 def _check_keyword_context(register_entry: Dict[str, Any], our_companies_list: List[str]) -> Optional[str]:
     """
     Scans the raw text for 'Deep Context' around EVERY mention of our company.
@@ -1724,6 +1768,7 @@ def _check_keyword_context(register_entry: Dict[str, Any], our_companies_list: L
 def _classify_type(register_entry: Dict[str, Any], our_companies_list: List[str]) -> str:
     """
     Decides Sales vs Purchase.
+    PRIORITY: Position-based logic FIRST, then keyword context as tie-breaker.
     """
     vendor_name = register_entry.get("Vendor Name") or ""
     customer_name = register_entry.get("Customer Name") or ""
@@ -1741,18 +1786,22 @@ def _classify_type(register_entry: Dict[str, Any], our_companies_list: List[str]
     us_is_vendor = is_us(vendor_name)
     us_is_customer = is_us(customer_name)
 
-    # 1. DEEP CONTEXT OVERRIDE (Fixes swapped fields - most reliable signal)
-    # This scans the actual invoice text for keywords around our company name
-    context_type = _check_keyword_context(register_entry, our_companies_list)
-    if context_type:
-        # If context says Sales, but we are Customer -> We will Swap later.
-        # Just return the correct Type here.
-        return context_type
+    # 0. DOCUMENT ISSUER SIGNAL (STRONGEST - Overrides position if document number/filename indicates we issued it)
+    # This catches cases where LLM swapped vendor/customer but document number shows we issued it
+    issuer_signal = _check_document_issuer_signal(register_entry, our_companies_list)
+    if issuer_signal == "Sales":
+        # If document number/filename shows we issued it, but position says we're customer -> likely field swap
+        if us_is_customer and not us_is_vendor:
+            log.warning(f"Document number/filename indicates Sales (we issued it), but position shows us as Customer -> Likely field swap. Forcing Sales.")
+            return "Sales"
+        # If we're already vendor, this confirms it
+        if us_is_vendor:
+            return "Sales"
 
-    # 2. POSITION LOGIC
+    # 1. POSITION LOGIC (PRIMARY - Most reliable when LLM extracts correctly)
     if us_is_vendor and not us_is_customer:
+        # We are clearly the vendor -> Sales invoice
         # Special case: If customer is an individual (not a company), be more cautious
-        # Individual names typically don't have company suffixes like "B.V.", "Ltd", etc.
         customer_name_lower = (customer_name or "").lower()
         is_individual = not any(suffix in customer_name_lower for suffix in ["b.v.", "bv", "ltd", "limited", "inc", "llc", "gmbh", "sa", "sarl", "nv", "spa", "corp", "corporation"])
         
@@ -1764,17 +1813,34 @@ def _classify_type(register_entry: Dict[str, Any], our_companies_list: List[str]
                 log.info(f"Position says Sales (we are vendor to individual '{customer_name}'), but context says Purchase -> Purchase (likely field swap)")
                 return "Purchase"
         
+        # Foreign IBAN override: If we're vendor but there's a foreign IBAN, it's likely an import (Purchase)
         if _check_foreign_iban(register_entry, our_companies_list):
             return "Purchase"
         return "Sales"
 
     if us_is_customer and not us_is_vendor:
+        # We are clearly the customer -> Purchase invoice
+        # BUT: Check if document number suggests we issued it (strong override for field swaps)
+        if issuer_signal == "Sales":
+            log.warning(f"Position says Purchase (we are customer), but document number/filename indicates we issued it -> Likely field swap. Forcing Sales.")
+            return "Sales"
         return "Purchase"
 
+    # 2. AMBIGUOUS CASES (Both match or neither match) - Use keyword context
     if us_is_vendor and us_is_customer:
-        return "Purchase"
+        # Both positions match - use keyword context to decide
+        context_type = _check_keyword_context(register_entry, our_companies_list)
+        if context_type:
+            return context_type
+        # Default: If we're vendor, it's more likely Sales
+        return "Sales"
 
-    # 4. FALLBACK LOGIC
+    # 3. NEITHER MATCHES - Use keyword context and fallback logic
+    context_type = _check_keyword_context(register_entry, our_companies_list)
+    if context_type:
+        return context_type
+
+    # 4. FALLBACK LOGIC (Country-based)
     vendor_address = register_entry.get("Vendor Address") or ""
     customer_address = register_entry.get("Customer Address") or ""
     v_country = _extract_country_from_address(vendor_address)
@@ -1789,7 +1855,8 @@ def _classify_type(register_entry: Dict[str, Any], our_companies_list: List[str]
         if is_c_nl and not is_v_nl:
             return "Purchase"
         if is_v_nl and is_c_nl:
-            return "Purchase"
+            # Both NL - can't determine from country alone, return Unclassified
+            return "Unclassified"
 
     return "Unclassified"
 

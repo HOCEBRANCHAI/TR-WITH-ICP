@@ -1,6 +1,27 @@
-# processor.py
-# Robust extraction, OCR, FX, validation, mapping, and posting.
-# Used by app.py. No server here.
+"""
+Invoice processing pipeline (synchronous).
+
+This module is the "engine" behind the API in `app.py`.
+
+### What this project does (high-level)
+Given an uploaded invoice document (PDF/image), we produce a structured transaction record:
+1) Extract text from the document (PDF text extraction or OCR)
+2) Use an LLM to convert invoice text into a strict JSON schema
+3) Validate and normalize the extracted fields (dates/currency/amount math)
+4) Map the LLM schema into a "transaction register" entry (fields used by the frontend)
+5) Classify invoice as Sales vs Purchase using our company names + context heuristics
+6) Determine Dutch VAT return category + ICP reporting fields (NL-specific logic)
+7) (Optional) Convert amounts into EUR using historical FX rates
+8) (Optional) Build a balanced journal entry via data-driven posting rules
+
+### Important notes / current design reality (be honest)
+- This file currently contains multiple concerns (OCR, LLM calls, VAT logic, FX, posting rules).
+  It works, but it is monolithic. A future refactor should split this into:
+  `extraction/` (OCR + LLM) and `domain/` (classification + VAT + posting + FX).
+- The pipeline depends heavily on the quality of extracted text. When OCR is weak, downstream
+  classification becomes less reliable. Validation + confidence scoring tries to flag this.
+"""
+
 import io
 import os
 import re
@@ -8,9 +29,7 @@ import json
 import logging
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import date, timedelta
-# Money / math
 from decimal import Decimal, ROUND_HALF_UP
-# OCR & PDF
 import PyPDF2
 import boto3
 from pdf2image import convert_from_bytes
@@ -18,28 +37,19 @@ from PIL import Image
 import cv2
 import numpy as np
 import pytesseract
-import difflib  # Used for fuzzy string matching
-
-# LLM + HTTP
+import difflib  
 from openai import OpenAI
 import requests
-
-# Env
 from dotenv import load_dotenv
 import pathlib
-
-# Initialize logging first
 log = logging.getLogger("invoice-processor")
 if not log.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-# Load .env file - try multiple locations
 env_paths = [
     pathlib.Path(__file__).parent / '.env',  # Same directory as processor.py
     pathlib.Path.cwd() / '.env',  # Current working directory
     pathlib.Path.home() / '.env',  # Home directory (fallback)
 ]
-
 env_loaded = False
 for env_path in env_paths:
     if env_path.exists():
@@ -59,9 +69,8 @@ if not os.getenv("OPENAI_API_KEY"):
     log.warning("Please ensure your .env file contains: OPENAI_API_KEY=your_key_here")
 else:
     log.info("OpenAI API key loaded successfully")
-
-
 # -------------------- Money helpers --------------------
+# We treat amounts as Decimal internally for accuracy and rounding predictability.
 CENT = Decimal("0.01")
 RATE_PREC = Decimal("0.0001")
 
@@ -75,6 +84,7 @@ def nearly_equal_money(a: Decimal, b: Decimal, tol: Decimal = CENT) -> bool:
     return abs(q_money(a) - q_money(b)) <= tol
 
 # -------------------- Dates & currency --------------------
+# Dates are expected in ISO format because they serialize cleanly and are unambiguous.
 ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 def ensure_iso_date(s: Optional[str], field: str, errors: List[str]) -> Optional[date]:
@@ -145,10 +155,16 @@ def get_eur_rate(invoice_date: date, ccy: str) -> Tuple[Decimal, str]:
         d = _prev_business_day(d - timedelta(days=1))
     
     # NEW: Better fallback than crash
-    log.error(f"No EUR rate found for {ccy} near {invoice_date.isoformat()}. Using 1.0.")
+    log.error(f"No EUR rate found for {ccy} near {invoice_date.isoformat()}. Using 1.0.")#not efficient 
     return Decimal("1.0"), invoice_date.isoformat()
 
-# -------------------- OCR (robust, supports PDFs & images) --------------------
+# -------------------- OCR / text extraction (robust; supports PDFs & images) --------------------
+# Goal: produce the best possible raw invoice text given a PDF or an image.
+#
+# Strategy:
+# - For "real text PDFs" we prefer PyPDF2 (fast, no external services).
+# - For scanned invoices / images we prefer AWS Textract (better at forms/tables).
+# - If Textract isn't available or is still weak, fall back to Tesseract with preprocessing.
 def _aws_region() -> str:
     """
     Prefer AWS_REGION if set, otherwise AWS_DEFAULT_REGION, otherwise us-east-1.
@@ -179,8 +195,6 @@ def _preprocess_for_tesseract(pil_img: Image.Image) -> Image.Image:
         11,
     )
     return Image.fromarray(img)
-
-
 def _textract_analyze_image(img_bytes: bytes) -> str:
     textract = boto3.client("textract", region_name=_aws_region())
     resp = textract.analyze_document(
@@ -232,6 +246,19 @@ def _tesseract_ocr(pil_img: Image.Image) -> str:
     return pytesseract.image_to_string(pre, config="--psm 6 -l eng")
 
 def get_text_from_pdf(pdf_bytes: bytes, filename: str) -> str:
+    """
+    Best-effort text extraction for PDFs.
+
+    Returns the first "good enough" text output, with progressive fallbacks:
+    1) PyPDF2 text extraction
+    2) AWS Textract detect_document_text on the raw PDF bytes
+    3) Render PDF to images and run AWS Textract analyze_document per page
+    4) Render PDF to images and run Tesseract OCR per page
+
+    If everything yields only minimal text, we return the "best attempt" instead of crashing,
+    because downstream systems prefer partial data over hard failure. If literally nothing can
+    be extracted, we raise.
+    """
     best_text: str = ""
     best_source: str = ""
 
@@ -325,8 +352,12 @@ def get_text_from_pdf(pdf_bytes: bytes, filename: str) -> str:
 
 def get_text_from_image(image_bytes: bytes, filename: str) -> str:
     """
-    Robust text extraction for image-based invoices (JPEG, PNG, TIFF, etc.)
-    using AWS Textract + Tesseract.
+    Best-effort text extraction for image-based invoices (JPEG, PNG, TIFF, etc.).
+
+    Fallback order:
+    1) AWS Textract detect_document_text
+    2) AWS Textract analyze_document (FORMS + TABLES)
+    3) Tesseract OCR with preprocessing
     """
     best_text: str = ""
     best_source: str = ""
@@ -395,6 +426,11 @@ def get_text_from_image(image_bytes: bytes, filename: str) -> str:
 def get_text_from_document(file_bytes: bytes, filename: str) -> str:
     """
     Entry point for *any* uploaded document.
+
+    We detect PDF vs image primarily via file signature/extension:
+    - If PDF: run the PDF pipeline
+    - If known image: run the image pipeline
+    - Otherwise: try PDF first, then image as fallback
     """
     name = (filename or "").lower()
     ext = os.path.splitext(name)[1]
@@ -416,6 +452,13 @@ def get_text_from_document(file_bytes: bytes, filename: str) -> str:
         return get_text_from_image(file_bytes, filename)
 
 # -------------------- LLM extraction --------------------
+# Goal: convert messy invoice text into a strict, structured JSON object.
+#
+# Notes:
+# - We ask OpenAI to return JSON only (response_format json_object) to reduce parsing errors.
+# - This stage is extremely sensitive to input text quality (OCR) and truncation.
+# - For production-grade quality, we should minimize "blind truncation" and instead
+#   reduce to the most relevant regions (e.g., totals, VAT blocks, addresses, line items).
 SECTION_LABELS = [
     "invoice", "total", "subtotal", "tax", "vat", "btw", "reverse charge",
     "verlegd", "omgekeerde heffing", "bill to", "payer", "customer", "vendor",
@@ -423,6 +466,15 @@ SECTION_LABELS = [
 ]
 
 def reduce_invoice_text(raw_text: str, window: int = 300) -> str:
+    """
+    Reduce long raw text to likely-relevant regions around invoice keywords.
+
+    Why:
+    - Many invoices contain long footers, legal terms, and repeated headers.
+    - Blindly taking the first N characters can exclude the totals/VAT blocks.
+
+    This helper extracts multiple windows around section labels and merges overlaps.
+    """
     text = raw_text or ""
     text_low = text.lower()
     spans: List[Tuple[int, int]] = []
@@ -539,6 +591,17 @@ SCHEMA:
 
 """
 def structure_text_with_llm(invoice_text: str, filename: str) -> dict:
+    """
+    Send invoice text to the LLM and parse the strict JSON response.
+
+    Output:
+    - A dict matching the schema described in LLM_PROMPT
+
+    IMPORTANT:
+    - If this returns an empty dict, downstream mapping/classification will become guessy.
+      A future improvement is to return a typed result with explicit error codes so the API
+      can report "extraction failed" instead of returning low-quality classifications.
+    """
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("OPENAI_API_KEY not found")
@@ -550,13 +613,16 @@ def structure_text_with_llm(invoice_text: str, filename: str) -> dict:
             temperature=0.0,
             messages=[
                 {"role": "system", "content": LLM_PROMPT},
-                {"role": "user", "content": f"INVOICE TEXT:\n{invoice_text[:12000]}"}
+                # NOTE: The caller is responsible for passing a reduced, bounded text
+                # (see reduce_invoice_text()). We still hard-cap as a safety net.
+                {"role": "user", "content": f"INVOICE TEXT:\n{(invoice_text or '')[:12000]}"}
             ]
         )
         return json.loads(r.choices[0].message.content)
     except Exception as e:
-        log.error(f"LLM error {filename}: {e}")
-        return {}
+        # IMPORTANT: Do not silently return {}. Bubble up so the pipeline state can fail fast
+        # and downstream mapping/classification will not run.
+        raise RuntimeError(f"LLM structuring failed for {filename}: {e}") from e
 
 def _translate_to_english_if_dutch(text: str) -> str:
     """
@@ -603,6 +669,9 @@ def _translate_to_english_if_dutch(text: str) -> str:
 
 
 # -------------------- Validation & mapping --------------------
+# Validation is intentionally conservative:
+# - We prefer flagging issues (errors/warnings) over silently "fixing" extracted values.
+# - Confidence scoring uses validation errors + text quality to suggest manual review.
 def _estimate_extraction_confidence(invoice_text: str, llm_data: Dict[str, Any], validation_errors: Optional[List[str]] = None) -> Tuple[str, str]:
     """
     Heuristic confidence score for how reliable the extraction likely is.
@@ -869,6 +938,7 @@ def _normalize_company_name(name: str) -> str:
     
     return normalized
 
+
 def _calculate_name_similarity(name1: str, name2: str) -> float:
     """
     Calculates similarity between two normalized company names using difflib.
@@ -937,8 +1007,10 @@ def _is_same_country_code(code: str, country_name: str) -> bool:
     return False
 
 # ----------------------------------------------------------------------------
-# EU Country Detection & Address Parsing (Keep Original Robust Logic)
+# EU Country Detection & Address Parsing
 # ----------------------------------------------------------------------------
+# We use lightweight heuristics to infer country from addresses when the LLM misses it.
+# This is important because VAT box mapping depends heavily on whether a party is NL/EU/non-EU.
 
 EU_COUNTRIES = {
     # Full country names
@@ -1046,6 +1118,8 @@ def _extract_country_from_address(address: str) -> Optional[str]:
     return None
 
 # -------------------- Dutch VAT Box Mapping --------------------
+# This is deterministic domain logic (not LLM-driven). It maps a transaction to a Dutch VAT
+# return box using country + goods/services + VAT rate + reverse charge signals.
 
 DUTCH_VAT_CATEGORY_DESCRIPTIONS: Dict[str, str] = {
     "1a": "Domestic sales taxed at 21%",
@@ -1078,7 +1152,7 @@ def _determine_dutch_vat_return_category(
     Map an invoice to a Dutch VAT return box using  rule-based logic.
 
     Returns:
-        (vat_box, reasoning)
+        (vat_box, reasoning)    
         vat_box ∈ {"1a","1b","1e","2a","3a","3b","4a","4b","5a","UNDETERMINED"}
     """
     try:
@@ -1398,6 +1472,22 @@ def _determine_invoice_subcategory(
 
 
 def _set_icp_fields_for_nl(register_entry: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Sets ICP (Intra-Community Procedure) reporting fields for Dutch VAT returns.
+    
+    ICP reporting is REQUIRED ONLY for:
+    - Sales invoices (Type = "Sales")
+    - To EU customers (non-NL)
+    - With 0% VAT (Intra-EU B2B transactions)
+    - With customer VAT number (B2B requirement)
+    - VAT boxes 3a (goods) or 3b (services)
+    
+    ICP is NOT required for:
+    - Sales with VAT charged (e.g., 21% VAT to EU customer = Box 1a, not ICP)
+    - Sales to NL customers (domestic)
+    - Sales to non-EU customers (exports)
+    - Purchase invoices
+    """
     # Defaults
     register_entry["ICP Return Required"] = "No"
     register_entry["ICP Reporting Category"] = ""
@@ -1408,6 +1498,7 @@ def _set_icp_fields_for_nl(register_entry: Dict[str, Any]) -> Dict[str, Any]:
 
     counterparty_country = register_entry.get("Customer Country")
     counterparty_vat_number = register_entry.get("Customer VAT ID")
+    vat_box = register_entry.get("Dutch VAT Return Category", "")
 
     if not counterparty_country:
         return register_entry
@@ -1420,17 +1511,27 @@ def _set_icp_fields_for_nl(register_entry: Dict[str, Any]) -> Dict[str, Any]:
     if not counterparty_vat_number or not str(counterparty_vat_number).strip():
         return register_entry
 
-    # At this point we know: Sales + EU (non‑NL) + VAT ID present → ICP relevant.
-    indicator = (register_entry.get("Goods Services Indicator") or "").lower()
-    if indicator == "goods":
+    # CRITICAL FIX: ICP is only required for VAT boxes 3a (goods) and 3b (services)
+    # These boxes represent Intra-EU B2B transactions with 0% VAT
+    # If VAT box is 1a, 1b, 1e, 2a, or anything else, ICP is NOT required
+    if vat_box == "3a":
+        # Intra-EU supply of goods (B2B, 0% VAT)
         register_entry["ICP Return Required"] = "Yes"
         register_entry["ICP Reporting Category"] = "Intra-EU supply of goods (B2B)"
-    elif indicator == "services":
+        return register_entry
+    elif vat_box == "3b":
+        # Intra-EU supply of services (B2B, 0% VAT, reverse charge)
         register_entry["ICP Return Required"] = "Yes"
         register_entry["ICP Reporting Category"] = "Intra-EU supply of services (B2B, reverse charge)"
-    else:
-        register_entry["ICP Return Required"] = "Yes"
-        register_entry["ICP Reporting Category"] = "Intra-EU B2B supply (goods/services unclear)"
+        return register_entry
+    
+    # If VAT box is not 3a or 3b, ICP is NOT required
+    # This handles cases like:
+    # - Box 1a: Sales to EU customer with 21% VAT (domestic sales, not ICP)
+    # - Box 1b: Sales to EU customer with 9% VAT (domestic sales, not ICP)
+    # - Box 1e: Exports to non-EU (not ICP)
+    # - Box 2a: Domestic reverse charge (not ICP)
+    # - UNDETERMINED: Cannot determine, so no ICP
 
     return register_entry
 
@@ -1452,19 +1553,18 @@ def _derive_vat_rate_percent(llm_data: Dict[str, Any]) -> Optional[float]:
 def _is_credit_note_simple(llm_data: Dict[str, Any], invoice_text: str) -> bool:
     """
     Detect whether the document is a credit note.
-
-    Logic:
+    logic:
     1. If LLM explicitly says document_type contains 'credit' → treat as credit note.
     2. Otherwise, look for common credit‑note keywords in the raw text.
     """
     doc_type = (llm_data.get("document_type") or "").strip().lower()
     if "credit" in doc_type:
         return True
-
+                                                                                                                                        
     text = (invoice_text or "").lower()
     if not text:
         return False
-
+                                                                                                                                                       
     keywords = [
         "credit note",
         "creditnote",
@@ -1476,6 +1576,16 @@ def _is_credit_note_simple(llm_data: Dict[str, Any], invoice_text: str) -> bool:
     return any(kw in text for kw in keywords)
 
 def _map_llm_output_to_register_entry(llm_data: Dict[str, Any], filename: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Map the raw LLM schema into the register-entry shape used by the frontend and downstream logic.
+
+    This is the main "boundary" between extraction output and domain logic.
+    Key behaviors:
+    - Sets amounts (and negates for credit notes)
+    - Derives VAT rate and reverse charge flags
+    - Attempts to infer countries from extracted addresses
+    - Adds an extraction confidence signal for UI/review workflows
+    """
     description = ""
     if llm_data.get("line_items"):
         raw_desc = llm_data["line_items"][0].get("description", "") or ""
@@ -1716,80 +1826,210 @@ def _check_document_issuer_signal(register_entry: Dict[str, Any], our_companies_
 
 def _check_keyword_context(register_entry: Dict[str, Any], our_companies_list: List[str]) -> Optional[str]:
     """
-    Scans the raw text for 'Deep Context' around EVERY mention of our company.
-    Finds 'Ship-to', 'Debtor', 'Client' = Purchase.
-    Finds 'Seller', 'Supplier' = Sales.
-    Uses signal counting to handle multi-page invoices with conflicting signals.
+    Infer Sales vs Purchase by scanning the raw OCR/PDF text for *role-labelled* mentions
+    of our company name.
+
+    Why this exists:
+    - Vendor/Customer fields can be swapped or noisy depending on OCR/LLM extraction.
+    - A naive "character window" around the company name is brittle because OCR often
+      interleaves unrelated blocks (e.g., "Bill To" text appears close to "Supplier" block).
+
+    Approach:
+    - Split text into lines, normalize both labels and company names into a simplified form
+      (lowercase, punctuation->spaces, whitespace collapsed).
+    - Count role signals only when a role label is on the *same line* as our company
+      OR the label is immediately above the line that contains our company (common layout).
+
+    Returns:
+    - "Sales" if we are strongly identified as Supplier/Seller/Vendor/Issuer
+    - "Purchase" if we are strongly identified as Buyer/Customer/Bill To/Ship To/Invoice To
+    - None if no strong signal is found
     """
     raw_text = register_entry.get("Full_Extraction_Data", {}).get("_invoice_text", "")
     if not raw_text:
         return None
-    
-    raw_lower = raw_text.lower()
-    
-    # Track scores (multi-page invoices might have conflicting signals)
+
+    def _simplify_for_roles(s: str) -> str:
+        s = (s or "").casefold()
+        # Replace punctuation with spaces but keep line structure outside this function.
+        s = re.sub(r"[\t\r\f\v]+", " ", s)
+        s = re.sub(r"[\\/_.,()\[\]{}'\"&:;|<>]+", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    # Role labels (already "simplified" form: lowercase + spaces)
+    customer_labels = [
+        "buyer",
+        "customer",
+        "bill to",
+        "invoice to",
+        "ship to",
+        "deliver to",
+        "consignee",
+        "debtor",
+        "client",
+        "afnemer",
+        "klant",
+    ]
+    vendor_labels = [
+        "supplier",
+        "seller",
+        "vendor",
+        "issuer",
+        "invoice from",
+        "bill from",
+        "remit to",
+        "remittance",
+        "leverancier",
+        "verkoper",
+    ]
+
+    # Prepare normalized lines; ignore very short/noisy lines
+    raw_lines = raw_text.splitlines()
+    lines = []
+    for ln in raw_lines:
+        simp = _simplify_for_roles(ln)
+        if simp and len(simp) >= 3:
+            lines.append(simp)
+
+    if not lines:
+        return None
+
+    def _label_near_company(line: str, label: str, comp: str, max_gap: int = 40) -> bool:
+        """True if label appears before company on same line within a small distance."""
+        if label not in line or comp not in line:
+            return False
+        # Check proximity using first occurrence positions (good enough for scoring)
+        li = line.find(label)
+        ci = line.find(comp)
+        if li == -1 or ci == -1:
+            return False
+        # Prevent false positives like "... Acme ... from ..."
+        if li > ci:
+            return False
+        return (ci - li) <= max_gap
+
+    def _prev_line_has_label(prev_line: str, labels: List[str]) -> bool:
+        """
+        Stricter than substring search to reduce OCR noise:
+        - match if line equals the label ("bill to")
+        - or starts with the label ("bill to address", "supplier details")
+        """
+        if not prev_line:
+            return False
+        for lab in labels:
+            if prev_line == lab:
+                return True
+            if prev_line.startswith(lab + " "):
+                return True
+        return False
+
     sales_signals = 0
     purchase_signals = 0
 
     for company in our_companies_list:
         comp_norm = _normalize_company_name(company)
-        start_pos = 0
-        while True:
-            idx = raw_lower.find(comp_norm, start_pos)
-            if idx == -1:
-                break
-            
-            # Look at the window BEFORE the company name (150 chars)
-            window_before = raw_lower[max(0, idx-150):idx]
-            # Also look at the window AFTER the company name (100 chars)
-            window_after = raw_lower[idx:min(len(raw_lower), idx+len(comp_norm)+100)]
-            
-            # Purchase Keywords (We are receiving goods/services)
-            purchase_keywords = ["buyer", "customer", "bill to", "ship to", "ship-to", "consignee", "debtor", "client", "invoice to", "afnemer", "klant"]
-            if any(x in window_before for x in purchase_keywords) or any(x in window_after for x in purchase_keywords):
-                purchase_signals += 1
-            
-            # Sales Keywords (We are providing goods/services)
-            sales_keywords = ["seller", "supplier", "vendor", "provider", "issuer", "leverancier", "verkoper"]
-            if any(x in window_before for x in sales_keywords) or any(x in window_after for x in sales_keywords):
-                sales_signals += 1
-            
-            start_pos = idx + 1
+        if not comp_norm:
+            continue
 
-    if purchase_signals > sales_signals:
-        log.info(f"Deep Context: Found {purchase_signals} Purchase signals vs {sales_signals} Sales signals -> Purchase")
+        # Look for the normalized company name in the simplified lines
+        for i, line in enumerate(lines):
+            if comp_norm not in line:
+                continue
+
+            prev1 = lines[i - 1] if i - 1 >= 0 else ""
+            prev2 = lines[i - 2] if i - 2 >= 0 else ""
+
+            # Strong signal: label and company on same line, and close together
+            if any(_label_near_company(line, lab, comp_norm) for lab in vendor_labels):
+                sales_signals += 2
+            if any(_label_near_company(line, lab, comp_norm) for lab in customer_labels):
+                purchase_signals += 2
+
+            # Medium signal: label on the line above, company on this line
+            if prev1:
+                if _prev_line_has_label(prev1, vendor_labels):
+                    # Common layout: "Bill To:" / "Supplier:" on its own line, party name on next line
+                    sales_signals += 2
+                if _prev_line_has_label(prev1, customer_labels):
+                    purchase_signals += 2
+            if prev2:
+                if _prev_line_has_label(prev2, vendor_labels):
+                    sales_signals += 1
+                if _prev_line_has_label(prev2, customer_labels):
+                    purchase_signals += 1
+
+    # Require a margin to avoid flipping on weak/noisy evidence
+    if purchase_signals >= sales_signals + 2:
+        log.info(f"Deep Context (role lines): Found {purchase_signals} Purchase vs {sales_signals} Sales -> Purchase")
         return "Purchase"
-    if sales_signals > purchase_signals:
-        log.info(f"Deep Context: Found {sales_signals} Sales signals vs {purchase_signals} Purchase signals -> Sales")
+    if sales_signals >= purchase_signals + 2:
+        log.info(f"Deep Context (role lines): Found {sales_signals} Sales vs {purchase_signals} Purchase -> Sales")
         return "Sales"
-        
+
     return None
 
 def _classify_type(register_entry: Dict[str, Any], our_companies_list: List[str]) -> str:
+    """
+    Decide whether an invoice is a Sales invoice (we issued it) or a Purchase invoice (we received it).
+
+    Classification signals (rough priority order):
+    - Strong issuer signals from document number / filename (if they contain our name/initials)
+    - Vendor/customer name match vs our company list (robust token-set similarity)
+    - Keyword context around mentions of our company ("bill to", "supplier", etc.)
+    - Country-based fallback (NL vs non-NL)
+
+    NOTE:
+    - This logic depends on the LLM extracting vendor/customer fields correctly.
+      If extraction is missing/incorrect, we may still return Unclassified.
+    """
     """
     Decides Sales vs Purchase.
     PRIORITY: Position-based logic FIRST, then keyword context as tie-breaker.
     """
     vendor_name = register_entry.get("Vendor Name") or ""
     customer_name = register_entry.get("Customer Name") or ""
-    
-    our_norms = [_normalize_company_name(x) for x in our_companies_list if x]
 
-    # Helper: Check if name matches 'us' using Token Set Ratio
-    def is_us(target_raw):
+    # Score-based matching (more accurate than a single boolean threshold).
+    # This reduces false flips when both names partially match (or both don't match well).
+    def best_us_score(target_raw: str) -> Tuple[float, Optional[str]]:
         best = 0.0
+        best_our = None
         for our_raw in our_companies_list:
             score = _calculate_name_similarity_robust(our_raw, target_raw)
-            best = max(best, score)
-        return best > 0.8  # High threshold
+            if score > best:
+                best = score
+                best_our = our_raw
+        return best, best_our
 
-    us_is_vendor = is_us(vendor_name)
-    us_is_customer = is_us(customer_name)
+    vendor_score, vendor_best = best_us_score(vendor_name)
+    customer_score, customer_best = best_us_score(customer_name)
+
+    # Keep the previous boolean interpretation, but derived from scores.
+    us_is_vendor = vendor_score >= 0.67
+    us_is_customer = customer_score >= 0.67
+
+    # Attach debug info for troubleshooting (kept internal under Full_Extraction_Data).
+    try:
+        fed = register_entry.get("Full_Extraction_Data")
+        if isinstance(fed, dict):
+            fed["_type_debug"] = {
+                "vendor_name": vendor_name,
+                "customer_name": customer_name,
+                "vendor_score": vendor_score,
+                "customer_score": customer_score,
+                "vendor_best_match": vendor_best,
+                "customer_best_match": customer_best,
+            }
+    except Exception:
+        pass
 
     # 0. DOCUMENT ISSUER SIGNAL (STRONGEST - Overrides position if document number/filename indicates we issued it)
     # This catches cases where LLM swapped vendor/customer but document number shows we issued it
     issuer_signal = _check_document_issuer_signal(register_entry, our_companies_list)
     if issuer_signal == "Sales":
+        if isinstance(register_entry.get("Full_Extraction_Data"), dict):
+            register_entry["Full_Extraction_Data"]["_type_debug"]["issuer_signal"] = "Sales"
         # If document number/filename shows we issued it, but position says we're customer -> likely field swap
         if us_is_customer and not us_is_vendor:
             log.warning(f"Document number/filename indicates Sales (we issued it), but position shows us as Customer -> Likely field swap. Forcing Sales.")
@@ -1798,20 +2038,54 @@ def _classify_type(register_entry: Dict[str, Any], our_companies_list: List[str]
         if us_is_vendor:
             return "Sales"
 
+    # If issuer signal didn't decide it, use score margins before the old position heuristics.
+    # This reduces wrong labels when the LLM swapped roles or when one side matches us much better.
+    context_type: Optional[str] = None
+    score_gap = abs(vendor_score - customer_score)
+
+    def _set_debug(k: str, v: Any) -> None:
+        fed = register_entry.get("Full_Extraction_Data")
+        if isinstance(fed, dict) and isinstance(fed.get("_type_debug"), dict):
+            fed["_type_debug"][k] = v
+
+    _set_debug("score_gap", score_gap)
+
+    # Strong wins
+    if vendor_score >= 0.80 and customer_score <= 0.50:
+        context_type = _check_keyword_context(register_entry, our_companies_list)
+        _set_debug("context_type", context_type)
+        # Only override strong vendor match if context is a strong opposite signal and vendor isn't near-certain.
+        if context_type == "Purchase" and vendor_score < 0.95:
+            _set_debug("decision", "Purchase (context overrides strong vendor match)")
+            return "Purchase"
+        _set_debug("decision", "Sales (strong vendor match)")
+        return "Sales"
+
+    if customer_score >= 0.80 and vendor_score <= 0.50:
+        context_type = _check_keyword_context(register_entry, our_companies_list)
+        _set_debug("context_type", context_type)
+        if context_type == "Sales" and customer_score < 0.95:
+            _set_debug("decision", "Sales (context overrides strong customer match)")
+            return "Sales"
+        _set_debug("decision", "Purchase (strong customer match)")
+        return "Purchase"
+
+    # Moderate wins if there is a clear gap and at least one side is reasonably confident.
+    if score_gap >= 0.20 and max(vendor_score, customer_score) >= 0.70:
+        chosen = "Sales" if vendor_score > customer_score else "Purchase"
+        _set_debug("decision", f"{chosen} (score gap)")
+        return chosen
+
     # 1. POSITION LOGIC (PRIMARY - Most reliable when LLM extracts correctly)
     if us_is_vendor and not us_is_customer:
         # We are clearly the vendor -> Sales invoice
-        # Special case: If customer is an individual (not a company), be more cautious
-        customer_name_lower = (customer_name or "").lower()
-        is_individual = not any(suffix in customer_name_lower for suffix in ["b.v.", "bv", "ltd", "limited", "inc", "llc", "gmbh", "sa", "sarl", "nv", "spa", "corp", "corporation"])
-        
-        if is_individual and customer_name:
-            # When customer is an individual and we're vendor, re-check keyword context
-            # This handles cases where LLM swapped fields and extracted individual as customer
-            recheck_context = _check_keyword_context(register_entry, our_companies_list)
-            if recheck_context == "Purchase":
-                log.info(f"Position says Sales (we are vendor to individual '{customer_name}'), but context says Purchase -> Purchase (likely field swap)")
-                return "Purchase"
+        # Cross-check against role-labelled raw-text context to catch vendor/customer swaps.
+        # This is intentionally strict: _check_keyword_context() only returns a result when
+        # it finds a strong label+our-company pairing, reducing false flips.
+        recheck_context = _check_keyword_context(register_entry, our_companies_list)
+        if recheck_context == "Purchase":
+            log.info("Position says Sales (we are Vendor), but role-labelled text context says Purchase -> Purchase (likely field swap)")
+            return "Purchase"
         
         # Foreign IBAN override: If we're vendor but there's a foreign IBAN, it's likely an import (Purchase)
         if _check_foreign_iban(register_entry, our_companies_list):
@@ -1824,20 +2098,30 @@ def _classify_type(register_entry: Dict[str, Any], our_companies_list: List[str]
         if issuer_signal == "Sales":
             log.warning(f"Position says Purchase (we are customer), but document number/filename indicates we issued it -> Likely field swap. Forcing Sales.")
             return "Sales"
+        # Cross-check against role-labelled raw-text context to catch vendor/customer swaps.
+        recheck_context = _check_keyword_context(register_entry, our_companies_list)
+        if recheck_context == "Sales":
+            log.info("Position says Purchase (we are Customer), but role-labelled text context says Sales -> Sales (likely field swap)")
+            return "Sales"
         return "Purchase"
 
     # 2. AMBIGUOUS CASES (Both match or neither match) - Use keyword context
     if us_is_vendor and us_is_customer:
         # Both positions match - use keyword context to decide
         context_type = _check_keyword_context(register_entry, our_companies_list)
+        _set_debug("context_type", context_type)
         if context_type:
+            _set_debug("decision", f"{context_type} (both match; context)")
             return context_type
         # Default: If we're vendor, it's more likely Sales
+        _set_debug("decision", "Sales (both match; default)")
         return "Sales"
 
     # 3. NEITHER MATCHES - Use keyword context and fallback logic
     context_type = _check_keyword_context(register_entry, our_companies_list)
+    _set_debug("context_type", context_type)
     if context_type:
+        _set_debug("decision", f"{context_type} (neither match; context)")
         return context_type
 
     # 4. FALLBACK LOGIC (Country-based)
@@ -1878,7 +2162,7 @@ def _enforce_role_consistency(register_entry: Dict[str, Any], our_companies_list
         for our_raw in our_companies_list:
             score = _calculate_name_similarity_robust(our_raw, target_raw)
             best = max(best, score)
-        return best > 0.8
+        return best >= 0.67
 
     us_is_vendor = is_us(vendor_name)
     us_is_customer = is_us(customer_name)
@@ -1902,6 +2186,13 @@ def _swap_vendor_customer(entry: Dict[str, Any]):
     entry["Vendor Country"], entry["Customer Country"] = entry["Customer Country"], entry["Vendor Country"]
 
 def _classify_and_set_subcategory(register_entry: Dict[str, Any], our_companies_list: List[str]) -> Dict[str, Any]:
+    """
+     -End-to-end enrichment step for the register entry:
+    - Classify invoice type (Sales/Purchase/Unclassified)
+    - Enforce role consistency (swap vendor/customer fields if needed)
+    - Determine subcategory + Dutch VAT box + ICP fields
+    - Attach VAT reasoning for auditability
+    """
     # 1. Classify
     invoice_type = _classify_type(register_entry, our_companies_list)
     register_entry["Type"] = invoice_type
@@ -1937,8 +2228,8 @@ def _classify_and_set_subcategory(register_entry: Dict[str, Any], our_companies_
                 invoice_type = "Sales"
             elif is_customer_nl and not is_vendor_nl:
                 invoice_type = "Purchase"
-            elif is_vendor_nl and is_customer_nl:
-                invoice_type = "Purchase" # Default assumption
+            # If both NL, do NOT guess (this was flipping many domestic Sales invoices).
+            # Leave as Unclassified and let name/context signals drive the decision.
             
             # Normalize fallback result
             if invoice_type:
@@ -2091,6 +2382,13 @@ def _classify_and_set_subcategory(register_entry: Dict[str, Any], our_companies_
     return register_entry
 
 def _convert_to_eur_fields(entry: dict, conversion_enabled: bool = True) -> dict:
+    """
+    Convert amounts from invoice currency to EUR.
+
+    - Uses exchangerate.host (ECB reference) with date lookback.
+    - Writes EUR fields alongside original currency fields.
+    - Does not raise for FX errors; it annotates the entry with `FX Error`.
+    """
     if not conversion_enabled:
         entry["FX Rate (ccy->EUR)"] = None
         entry["Nett Amount (EUR)"] = None
@@ -2142,16 +2440,163 @@ def _convert_to_eur_fields(entry: dict, conversion_enabled: bool = True) -> dict
         entry["FX Error"] = f"EUR conversion failed: {str(ex)}"
         return entry
 # -------------------- Main pipeline --------------------
+# `robust_invoice_processor` is the extraction "entrypoint" used by `app.py`.
+# It now returns a **state object** that captures stage outputs, errors, and guard results.
+# This makes extraction deterministic, debuggable, and prevents downstream logic from running
+# when extraction quality is weak.
+
+# Guard defaults (tuneable, but deterministic)
+MIN_OCR_TEXT_CHARS = 200
+MAX_RAW_TEXT_STORE_CHARS = 20000  # stored for debugging/traceability
+# If validation finds multiple hard errors, do not proceed (prevents wrong classification).
+MAX_VALIDATION_ERRORS_FOR_OK = 1
+
+def _init_extraction_state(filename: str) -> Dict[str, Any]:
+    return {
+        "status": "in_progress",          # in_progress | ok | partial | failed
+        "filename": filename,
+        "stage": None,                    # ocr | llm | validation
+        "errors": [],                     # list[str]
+        "warnings": [],                   # list[str]
+        "guards": {},                     # stage->guard results
+        "outputs": {                      # stage outputs
+            "ocr_text": None,
+            "reduced_text": None,
+            "llm_data": None,
+            "validation_errors": None,
+        },
+    }
+
+def _guard_min_ocr_text(state: Dict[str, Any]) -> bool:
+    text = (state["outputs"].get("ocr_text") or "").strip()
+    ok = len(text) >= MIN_OCR_TEXT_CHARS
+    state["guards"]["min_ocr_text_chars"] = {"ok": ok, "len": len(text), "min": MIN_OCR_TEXT_CHARS}
+    if not ok:
+        state["errors"].append(f"OCR text too short ({len(text)} chars). Minimum required is {MIN_OCR_TEXT_CHARS}.")
+    return ok
+
+def _guard_nonempty_llm_output(state: Dict[str, Any]) -> bool:
+    llm_data = state["outputs"].get("llm_data")
+    ok = isinstance(llm_data, dict) and bool(llm_data)
+    state["guards"]["nonempty_llm_output"] = {"ok": ok}
+    if not ok:
+        state["errors"].append("LLM output is empty or invalid (expected non-empty JSON object).")
+    return ok
+
+def _missing_critical_fields(llm_data: Dict[str, Any]) -> List[str]:
+    critical = ["invoice_date", "vendor_name", "customer_name", "subtotal", "total_vat", "total_amount"]
+    missing = []
+    for k in critical:
+        v = llm_data.get(k) if isinstance(llm_data, dict) else None
+        if v is None or (isinstance(v, str) and not v.strip()):
+            missing.append(k)
+    return missing
+
+def _guard_critical_fields(state: Dict[str, Any]) -> bool:
+    llm_data = state["outputs"].get("llm_data") or {}
+    missing = _missing_critical_fields(llm_data)
+    ok = len(missing) == 0
+    state["guards"]["critical_fields_present"] = {"ok": ok, "missing": missing}
+    if not ok:
+        state["errors"].append(f"Missing critical fields: {', '.join(missing)}")
+    return ok
+
+def _guard_validation_error_count(state: Dict[str, Any]) -> bool:
+    errs = state["outputs"].get("validation_errors") or []
+    ok = len(errs) <= MAX_VALIDATION_ERRORS_FOR_OK
+    state["guards"]["validation_error_count_ok"] = {
+        "ok": ok,
+        "count": len(errs),
+        "max": MAX_VALIDATION_ERRORS_FOR_OK,
+    }
+    if not ok:
+        state["errors"].append(
+            f"Too many validation errors ({len(errs)}). Maximum allowed is {MAX_VALIDATION_ERRORS_FOR_OK}."
+        )
+    return ok
+
+def _stage_ocr(state: Dict[str, Any], file_bytes: bytes) -> None:
+    state["stage"] = "ocr"
+    text = get_text_from_document(file_bytes, state["filename"])
+    state["outputs"]["ocr_text"] = text or ""
+
+def _stage_llm(state: Dict[str, Any]) -> None:
+    state["stage"] = "llm"
+    ocr_text = state["outputs"].get("ocr_text") or ""
+    reduced = reduce_invoice_text(ocr_text)
+    state["outputs"]["reduced_text"] = reduced
+    # LLM consumes reduced text (deterministic selection of relevant regions).
+    state["outputs"]["llm_data"] = structure_text_with_llm(reduced, state["filename"])
+
+def _stage_validation(state: Dict[str, Any]) -> None:
+    state["stage"] = "validation"
+    llm_data = state["outputs"].get("llm_data") or {}
+    _, _, _, _, _, validation_errors = validate_extraction(llm_data, state["filename"])
+    state["outputs"]["validation_errors"] = validation_errors or []
+
+def run_extraction_pipeline(file_bytes: bytes, filename: str) -> Dict[str, Any]:
+    """
+    Deterministic, step-based extraction pipeline with explicit state transitions and guards.
+
+    Stages:
+    - OCR: get_text_from_document
+    - LLM: structure_text_with_llm (consumes reduce_invoice_text output)
+    - Validation: validate_extraction
+
+    Guard conditions:
+    - minimum OCR text length
+    - non-empty LLM JSON output
+    - critical fields present (date, amounts, vendor/customer)
+
+    On guard failure:
+    - mark state as failed/partial
+    - stop execution early
+    """
+    state = _init_extraction_state(filename)
+    try:
+        # 1) OCR stage + guard
+        _stage_ocr(state, file_bytes)
+        if not _guard_min_ocr_text(state):
+            state["status"] = "failed"
+            return state
+
+        # 2) LLM stage + guard
+        _stage_llm(state)
+        if not _guard_nonempty_llm_output(state):
+            state["status"] = "failed"
+            return state
+
+        # 3) Validation stage + guards
+        _stage_validation(state)
+        if not _guard_critical_fields(state):
+            state["status"] = "partial"
+            return state
+        if not _guard_validation_error_count(state):
+            state["status"] = "partial"
+            return state
+
+        # Attach debug metadata to llm_data for downstream mapping (if executed)
+        llm_data = state["outputs"]["llm_data"]
+        ocr_text = state["outputs"]["ocr_text"] or ""
+        llm_data["_invoice_text"] = ocr_text[:MAX_RAW_TEXT_STORE_CHARS]
+        llm_data["_validation_errors"] = state["outputs"]["validation_errors"] or []
+
+        state["status"] = "ok"
+        return state
+
+    except Exception as e:
+        state["status"] = "failed"
+        state["errors"].append(str(e))
+        return state
+
+# Backwards-compatible name used by app.py (now returns state, not raw LLM dict).
 def robust_invoice_processor(pdf_bytes: bytes, filename: str) -> dict:
-    invoice_text = get_text_from_document(pdf_bytes, filename)
-    llm_data = structure_text_with_llm(invoice_text, filename)
-    # Validate extraction and capture errors for confidence scoring
-    _, _, _, _, _, validation_errors = validate_extraction(llm_data, filename)
-    llm_data["_invoice_text"] = invoice_text[:20000]
-    llm_data["_validation_errors"] = validation_errors  # Store for use in confidence scoring
-    return llm_data
+    return run_extraction_pipeline(pdf_bytes, filename)
 
 # -------------------- Posting rules (data-driven) --------------------
+# Optional: convert a register entry into a balanced journal entry.
+# This is intentionally rule-driven (conditions + postings), so you can add mappings
+# without changing Python logic everywhere.
 DEFAULT_COA = {
     "AR": "1100",
     "AP": "2000",
@@ -2263,6 +2708,7 @@ def build_journal_from_entry(entry: dict, coa: dict = None, rules: list = None) 
 
 __all__ = [
     "robust_invoice_processor",
+    "run_extraction_pipeline",
     "build_journal_from_entry",
     "DEFAULT_COA",
     "DEFAULT_RULES",

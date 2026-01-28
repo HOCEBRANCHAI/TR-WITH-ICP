@@ -1,3 +1,24 @@
+"""
+FastAPI application entrypoint (synchronous).
+
+This file exposes HTTP endpoints that call the core pipeline in `processor.py`.
+
+### What this API does
+- Accepts invoice documents (PDF or common image formats)
+- Runs the invoice processing pipeline:
+  1) OCR / text extraction (PyPDF2 → Textract → Tesseract fallbacks)
+  2) LLM structuring (OpenAI JSON schema extraction)
+  3) Validation + confidence scoring
+  4) Mapping into a "transaction register" entry (fields expected by the frontend)
+  5) Sales vs Purchase classification and NL VAT/ICP enrichment
+  6) Optional FX conversion into EUR
+- Returns a frontend-friendly JSON object (drops large internal fields like raw OCR text)
+
+### Design note (honest)
+`processor.py` currently contains both extraction (OCR/LLM) and domain logic (VAT rules, posting rules).
+This API layer should remain thin: validate inputs, call the pipeline, shape the response.
+"""
+
 import logging
 import os
 from typing import List
@@ -11,7 +32,8 @@ import pathlib
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("invoice-api")
 
-# Load environment variables from .env file - try multiple locations
+# Load environment variables from `.env` for local development.
+# In production (Render) env vars are provided via `render.yaml`.
 env_paths = [
     pathlib.Path(__file__).parent / '.env',  # Same directory as app.py
     pathlib.Path.cwd() / '.env',  # Current working directory
@@ -30,14 +52,16 @@ if not env_loaded:
     load_dotenv()
     log.info("Attempted to load .env from current directory")
 
-# Verify OpenAI API key is loaded
+# Verify OpenAI API key is loaded (we still allow the app to start without it;
+# uploads will fail when the pipeline calls the LLM).
 if not os.getenv("OPENAI_API_KEY"):
     log.warning("WARNING: OPENAI_API_KEY not found in environment variables!")
     log.warning("Please ensure your .env file contains: OPENAI_API_KEY=your_key_here")
 else:
     log.info("OpenAI API key loaded successfully")
 
-# Import from processor
+# Import the pipeline functions from `processor.py`.
+# NOTE: Keep imports explicit to make API → pipeline dependencies obvious.
 from processor import (
     robust_invoice_processor,
     _map_llm_output_to_register_entry,
@@ -144,7 +168,7 @@ def _format_register_entry_for_frontend(entry: dict) -> dict:
 
     return formatted
 
-# Configuration
+# Configuration (simple flags for now; in production this would typically come from env vars)
 conversion_enabled: bool = True  # Toggle currency conversion on/off
 
 # Create FastAPI app
@@ -158,6 +182,7 @@ app = FastAPI(
 )
 
 # Add CORS middleware
+# If you deploy a separate frontend, lock this down to your UI origin(s) instead of "*".
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -168,6 +193,10 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
+    """
+    Lightweight "service info" endpoint.
+    Helpful for quick health checks and to show what this API supports.
+    """
     return {
         "message": "Invoice Transaction Register Extractor API with Subcategory Classification",
         "docs": "/docs",
@@ -200,7 +229,7 @@ async def upload_and_extract(
     Upload a single invoice (PDF or image) and extract structured data with subcategory classification.
     """
     try:
-        # Validate file type (PDF or common image formats)
+        # 0) Validate file type (PDF or common image formats)
         content_type = (file.content_type or "").lower()
         if not (
             content_type.startswith("application/pdf")
@@ -212,7 +241,9 @@ async def upload_and_extract(
                 "error": f"Unsupported content-type: {file.content_type}. Only PDF and image types are accepted."
             })
 
-        # Parse company list
+        # 1) Parse the list of "our companies".
+        # This is a core classification input: we use it to decide whether we are the vendor (Sales)
+        # or the customer (Purchase), plus other context heuristics.
         our_companies_list = _split_company_list(our_companies)
         if not our_companies_list:
             return JSONResponse(status_code=400, content={
@@ -221,7 +252,7 @@ async def upload_and_extract(
                 "error": "No company name(s) provided. Provide a single name or a comma/newline-separated list."
             })
 
-        # Read file bytes
+        # 2) Read file bytes into memory (synchronous processing).
         file_bytes = await file.read()
         if not file_bytes:
             return JSONResponse(status_code=400, content={
@@ -232,19 +263,30 @@ async def upload_and_extract(
 
         log.info(f"Processing {file.filename}...")
 
-        # Step 1: Extract and process invoice
-        llm_data = robust_invoice_processor(file_bytes, file.filename)
+        # 3) Extraction stage: state-driven OCR + LLM + validation with explicit guards.
+        extraction_state = robust_invoice_processor(file_bytes, file.filename)
+        if extraction_state.get("status") != "ok":
+            # Do NOT proceed to mapping/classification on weak or failed extraction.
+            return JSONResponse(status_code=422, content={
+                "filename": file.filename,
+                "status": "error",
+                "error": "Extraction did not pass guard checks; downstream processing was skipped.",
+                "extraction_state": extraction_state,
+                "register_entry": None,
+            })
+        llm_data = (extraction_state.get("outputs") or {}).get("llm_data") or {}
 
-        # Step 2: Map to register entry format
+        # 4) Mapping stage: convert the LLM schema into our register-entry shape.
         register_entry = _map_llm_output_to_register_entry(llm_data, file.filename)
 
-        # Step 3: Classify type and set subcategory
+        # 5) Domain enrichment: Sales/Purchase classification + NL VAT box + ICP reporting fields.
         register_entry = _classify_and_set_subcategory(register_entry, our_companies_list)
 
-        # Step 4: Apply currency conversion
+        # 6) Optional enrichment: currency conversion into EUR (keeps original currency amounts too).
         register_entry = _convert_to_eur_fields(register_entry, conversion_enabled)
 
-        # Step 5: Add conversion info to Full_Extraction_Data for audit trace (internal use)
+        # 7) Internal audit trail: attach FX info and strip the heaviest field (raw invoice text)
+        # from the object returned to the client.
         if "Full_Extraction_Data" in register_entry:
             register_entry["Full_Extraction_Data"]["fx_conversion"] = {
                 "enabled": conversion_enabled,
@@ -256,7 +298,7 @@ async def upload_and_extract(
             # especially the raw invoice text, which is not useful for the UI.
             register_entry["Full_Extraction_Data"].pop("_invoice_text", None)
 
-        # Final shape for the frontend
+        # 8) Final response shape for the frontend (stable field names).
         formatted_entry = _format_register_entry_for_frontend(register_entry)
 
         return {
@@ -295,7 +337,7 @@ async def upload_multiple_and_extract(
         })
 
     try:
-        # Parse company list
+        # Parse the list of "our companies" once; reused for all files.
         our_companies_list = _split_company_list(our_companies)
         if not our_companies_list:
             return JSONResponse(status_code=400, content={
@@ -327,19 +369,29 @@ async def upload_multiple_and_extract(
                 if not file_bytes:
                     raise ValueError("File is empty.")
 
-                # Step 1: Extract and process invoice
-                llm_data = robust_invoice_processor(file_bytes, file.filename)
+                # Same pipeline stages as /upload, repeated per file.
+                extraction_state = robust_invoice_processor(file_bytes, file.filename)
+                if extraction_state.get("status") != "ok":
+                    results.append({
+                        "file_name": file.filename,
+                        "status": "error",
+                        "error": "Extraction did not pass guard checks; downstream processing was skipped.",
+                        "extraction_state": extraction_state,
+                        "register_entry": None,
+                    })
+                    continue
+                llm_data = (extraction_state.get("outputs") or {}).get("llm_data") or {}
 
-                # Step 2: Map to register entry format
+                # Map into the register entry shape
                 register_entry = _map_llm_output_to_register_entry(llm_data, file.filename)
 
-                # Step 3: Classify type and set subcategory
+                # Classification + VAT/ICP enrichment
                 register_entry = _classify_and_set_subcategory(register_entry, our_companies_list)
 
-                # Step 4: Apply currency conversion
+                # Optional FX conversion into EUR
                 register_entry = _convert_to_eur_fields(register_entry, conversion_enabled)
 
-                # Step 5: Add conversion info to Full_Extraction_Data for audit trace (internal use)
+                # Internal audit trail and stripping heavy raw text before returning
                 if "Full_Extraction_Data" in register_entry:
                     register_entry["Full_Extraction_Data"]["fx_conversion"] = {
                         "enabled": conversion_enabled,
@@ -368,7 +420,9 @@ async def upload_multiple_and_extract(
                     "register_entry": None,
                 })
 
-        # Calculate summary statistics
+        # Calculate summary statistics across successful extractions.
+        # NOTE: The "native currency totals" are summed regardless of currency; the EUR summary
+        # is the consistent cross-currency view when FX conversion is enabled and successful.
         from decimal import Decimal
         from processor import q_money
 
@@ -439,6 +493,7 @@ async def upload_multiple_and_extract(
         })
 
 # Local dev entrypoint
+# In production we run via `uvicorn app:app ...` (Render/Procfile).
 if __name__ == "__main__":
     import uvicorn
     log.info("Starting uvicorn server at http://127.0.0.1:8000")
